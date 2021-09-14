@@ -204,7 +204,8 @@ func (c *Cloud) ensureVpcLoadBalancer(ctx context.Context, clusterName string, s
 	)
 
 	command := c.determineCreateCommand(service, lbName)
-	outArray, err := execVpcCommand(command, c.determineVpcEnvSettings(service))
+	envSettings := c.determineVpcEnvSettings(service)
+	outArray, err := execVpcCommand(command, envSettings)
 	if err != nil {
 		return nil, c.Recorder.VpcLoadBalancerServiceWarningEvent(
 			service, CreatingCloudLoadBalancerFailed, lbName,
@@ -220,6 +221,8 @@ func (c *Cloud) ensureVpcLoadBalancer(ctx context.Context, clusterName string, s
 		switch lineType {
 		case "ERROR":
 			klog.Error(lineData)
+			klog.Errorf("failed command: %v", command)
+			klog.Errorf("failed env settings: %v", envSettings)
 			return nil, c.Recorder.VpcLoadBalancerServiceWarningEvent(
 				service, CreatingCloudLoadBalancerFailed, lbName,
 				fmt.Sprintf("Failed ensuring LoadBalancer: %v", lineData))

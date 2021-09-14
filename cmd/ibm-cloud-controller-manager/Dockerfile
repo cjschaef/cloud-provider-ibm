@@ -23,8 +23,7 @@
 # tag in order to have a deterministic build. For more information on
 # distroless images, see https://github.com/GoogleContainerTools/distroless.
 # The Kubernetes version update process will keep this image up-to-date.
-ARG IMAGE_SOURCE=gcr.io
-FROM $IMAGE_SOURCE/distroless/static@sha256:be5d77c62dbe7fedfb0a4e5ec2f91078080800ab1f18358e5f31fcc8faa023c4
+FROM registry.ci.openshift.org/ocp/4.9:base
 
 # Add Labels to image to show build details
 ARG this_build_id=unknown
@@ -43,7 +42,8 @@ ENV BUILD_TAG=${this_build_tag}
 ENV BUILD_SHA=${this_build_sha}
 
 WORKDIR /bin/
-ADD cmd/ibm-cloud-controller-manager/calicoctl /bin/
-ADD cmd/ibm-cloud-controller-manager/vpcctl /bin/
-ADD ibm-cloud-controller-manager /bin/
+COPY cmd/ibm-cloud-controller-manager/calicoctl /bin/
+COPY cmd/ibm-cloud-controller-manager/vpcctl /bin/
+COPY ibm-cloud-controller-manager /bin/
+
 ENTRYPOINT ["/bin/ibm-cloud-controller-manager"]

@@ -15,5 +15,6 @@ RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o ibm-cloud-controller-manager .
 FROM registry.ci.openshift.org/ocp/4.9:base
 LABEL description="IBM Cloud Controller Manager"
 COPY --from=vpc-builder /build/cloud-provider-vpc-controller/vpcctl-linux /bin/vpcctl
+COPY cmd/ibm-cloud-controller-manager/calicoctl /bin/calicoctl
 COPY --from=ccm-builder /build/ibm-cloud-controller-manager /bin/ibm-cloud-controller-manager
 ENTRYPOINT [ "/bin/ibm-cloud-controller-manager" ]
