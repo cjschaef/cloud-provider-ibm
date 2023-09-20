@@ -21,7 +21,10 @@ package vpcctl
 
 import (
 	"fmt"
+	"net"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.ibm.com/cloud-provider-ibm/pkg/klog"
@@ -36,7 +39,9 @@ const (
 	actionDeletePool         = "DELETE-POOL"
 	actionDeletePoolMember   = "DELETE-POOL-MEMBER"
 	actionReplacePoolMembers = "REPLACE-POOL-MEMBERS"
+	actionUpdateListener     = "UPDATE-LISTENER"
 	actionUpdatePool         = "UPDATE-POOL"
+	actionUpdateSubnets      = "UPDATE-SUBNETS"
 
 	poolToBeDeleted = "POOL-TO-BE-DELETED"
 )
@@ -106,24 +111,32 @@ func (c *CloudVpc) checkForMultiplePoolMemberUpdates(updatesRequired []string) [
 }
 
 // checkListenersForExtPortAddedToService - check to see if we have existing listener for the specified Kube service
-func (c *CloudVpc) checkListenersForExtPortAddedToService(updatesRequired []string, listeners []*VpcLoadBalancerListener, servicePort v1.ServicePort) []string {
+func (c *CloudVpc) checkListenersForExtPortAddedToService(updatesRequired []string, listeners []*VpcLoadBalancerListener, servicePort v1.ServicePort, servicePortRange string) []string {
 	for _, listener := range listeners {
-		if c.isServicePortEqualListener(servicePort, listener) {
+		// If this listener was marked for deletion, ignore the ports it was using
+		if listener.DefaultPool.Name == poolToBeDeleted {
+			continue
+		}
+		if c.isServicePortEqualListener(servicePort, servicePortRange, listener) {
 			// Found an existing listener for the external port, no additional update needed
 			return updatesRequired
 		}
 	}
 	// Listener for this service port was not found. Create the listener
-	poolName := genLoadBalancerPoolName(servicePort)
+	poolName := genLoadBalancerPoolName(servicePort, servicePortRange)
 	updatesRequired = append(updatesRequired, fmt.Sprintf("%s %s", actionCreateListener, poolName))
 	return updatesRequired
 }
 
 // checkListenerForExtPortDeletedFromService - check if there is a Kube service for the specified listener
-func (c *CloudVpc) checkListenerForExtPortDeletedFromService(updatesRequired []string, listener *VpcLoadBalancerListener, ports []v1.ServicePort) []string {
+func (c *CloudVpc) checkListenerForExtPortDeletedFromService(updatesRequired []string, listener *VpcLoadBalancerListener, ports []v1.ServicePort, servicePortRange string) []string {
+	// If the listener pool was marked for deletion, don't bother checking anything
+	if listener.DefaultPool.Name == poolToBeDeleted {
+		return updatesRequired
+	}
 	// Search for a matching port
 	for _, kubePort := range ports {
-		if c.isServicePortEqualListener(kubePort, listener) {
+		if c.isServicePortEqualListener(kubePort, servicePortRange, listener) {
 			// A service was found for the listener.  No updated needed.
 			return updatesRequired
 		}
@@ -139,8 +152,8 @@ func (c *CloudVpc) checkListenerForExtPortDeletedFromService(updatesRequired []s
 }
 
 // checkPoolsForExtPortAddedToService - check to see if we have existing pool for the specified Kube service
-func (c *CloudVpc) checkPoolsForExtPortAddedToService(updatesRequired []string, pools []*VpcLoadBalancerPool, servicePort v1.ServicePort) ([]string, error) {
-	poolName := genLoadBalancerPoolName(servicePort)
+func (c *CloudVpc) checkPoolsForExtPortAddedToService(updatesRequired []string, pools []*VpcLoadBalancerPool, servicePort v1.ServicePort, servicePortRange string) ([]string, error) {
+	poolName := genLoadBalancerPoolName(servicePort, servicePortRange)
 	for _, pool := range pools {
 		if pool.Name == poolName {
 			// Found an existing pool for the pool name, no additional update needed
@@ -155,7 +168,7 @@ func (c *CloudVpc) checkPoolsForExtPortAddedToService(updatesRequired []string, 
 			return updatesRequired, err
 		}
 		// If we already have a pool for the external port, no need to create a new pool
-		if c.isServicePortEqualPoolName(servicePort, poolNameFields) {
+		if c.isServicePortEqualPoolName(servicePort, servicePortRange, poolNameFields) {
 			return updatesRequired, nil
 		}
 	}
@@ -164,14 +177,18 @@ func (c *CloudVpc) checkPoolsForExtPortAddedToService(updatesRequired []string, 
 }
 
 // checkPoolForExtPortDeletedFromService - check to see if we have a Kube service for the specific pool
-func (c *CloudVpc) checkPoolForExtPortDeletedFromService(updatesRequired []string, pool *VpcLoadBalancerPool, ports []v1.ServicePort) ([]string, error) {
+func (c *CloudVpc) checkPoolForExtPortDeletedFromService(updatesRequired []string, pool *VpcLoadBalancerPool, ports []v1.ServicePort, servicePortRange string) ([]string, error) {
+	// If the pool was marked for deletion, don't bother checking anything else
+	if pool.Name == poolToBeDeleted {
+		return updatesRequired, nil
+	}
 	// Search through the service ports to find a matching external port
 	poolNameFields, err := extractFieldsFromPoolName(pool.Name)
 	if err != nil {
 		return updatesRequired, err
 	}
 	for _, kubePort := range ports {
-		if c.isServicePortEqualPoolName(kubePort, poolNameFields) {
+		if c.isServicePortEqualPoolName(kubePort, servicePortRange, poolNameFields) {
 			// Found a service for the pool, no additional update needed
 			return updatesRequired, nil
 		}
@@ -185,7 +202,7 @@ func (c *CloudVpc) checkPoolForExtPortDeletedFromService(updatesRequired []strin
 }
 
 // checkPoolForNodesToAdd - check to see if any of the existing members of a VPC pool need to be deleted
-func (c *CloudVpc) checkPoolForNodesToAdd(updatesRequired []string, pool *VpcLoadBalancerPool, ports []v1.ServicePort, nodeList []string) ([]string, error) {
+func (c *CloudVpc) checkPoolForNodesToAdd(updatesRequired []string, pool *VpcLoadBalancerPool, ports []v1.ServicePort, nodeList []string, useInstanceID bool, servicePortRange string) ([]string, error) {
 	// If the pool was marked for deletion, don't bother checking the members
 	if pool.Name == poolToBeDeleted {
 		return updatesRequired, nil
@@ -197,7 +214,7 @@ func (c *CloudVpc) checkPoolForNodesToAdd(updatesRequired []string, pool *VpcLoa
 	}
 	// Make sure that the node port of the pool is correct, i.e. generated poolName for Kube service must match actual pool name
 	for _, kubePort := range ports {
-		if c.isServicePortEqualPoolName(kubePort, poolNameFields) {
+		if c.isServicePortEqualPoolName(kubePort, servicePortRange, poolNameFields) {
 			// Found the correct kube service
 			if poolNameFields.NodePort != int(kubePort.NodePort) {
 				// Node port for the pool has changed.  All members (nodes) will be refreshed
@@ -210,6 +227,9 @@ func (c *CloudVpc) checkPoolForNodesToAdd(updatesRequired []string, pool *VpcLoa
 		foundMember := false
 		for _, member := range pool.Members {
 			memberTarget := member.TargetIPAddress
+			if useInstanceID {
+				memberTarget = member.TargetInstanceID
+			}
 			if nodeID == memberTarget && poolNameFields.NodePort == int(member.Port) {
 				// There is a pool member for this node.  Move on to the next node
 				foundMember = true
@@ -225,7 +245,7 @@ func (c *CloudVpc) checkPoolForNodesToAdd(updatesRequired []string, pool *VpcLoa
 }
 
 // checkPoolForNodesToDelete - check to see if any of the existing members of a VPC pool need to be deleted
-func (c *CloudVpc) checkPoolForNodesToDelete(updatesRequired []string, pool *VpcLoadBalancerPool, ports []v1.ServicePort, nodeList []string) ([]string, error) {
+func (c *CloudVpc) checkPoolForNodesToDelete(updatesRequired []string, pool *VpcLoadBalancerPool, ports []v1.ServicePort, nodeList []string, useInstanceID bool, servicePortRange string) ([]string, error) {
 	// If the pool was marked for deletion, don't bother checking the members
 	if pool.Name == poolToBeDeleted {
 		return updatesRequired, nil
@@ -237,7 +257,7 @@ func (c *CloudVpc) checkPoolForNodesToDelete(updatesRequired []string, pool *Vpc
 	}
 	// Make sure that the node port of the pool is correct, i.e. generated poolName for Kube service must match actual pool name
 	for _, kubePort := range ports {
-		if c.isServicePortEqualPoolName(kubePort, poolNameFields) {
+		if c.isServicePortEqualPoolName(kubePort, servicePortRange, poolNameFields) {
 			// Found the correct kube service port for the specified pool
 			if poolNameFields.NodePort != int(kubePort.NodePort) {
 				// Node port for the pool has changed.
@@ -250,6 +270,9 @@ func (c *CloudVpc) checkPoolForNodesToDelete(updatesRequired []string, pool *Vpc
 	nodeString := " " + strings.Join(nodeList, " ") + " "
 	for _, member := range pool.Members {
 		memberTarget := member.TargetIPAddress
+		if useInstanceID {
+			memberTarget = member.TargetInstanceID
+		}
 		if !strings.Contains(nodeString, " "+memberTarget+" ") || poolNameFields.NodePort != int(member.Port) {
 			updatesRequired = append(updatesRequired, fmt.Sprintf("%s %s %s %s %s", actionDeletePoolMember, pool.Name, pool.ID, member.ID, memberTarget))
 		}
@@ -257,8 +280,22 @@ func (c *CloudVpc) checkPoolForNodesToDelete(updatesRequired []string, pool *Vpc
 	return updatesRequired, nil
 }
 
-// checkPoolForServiceChanges - check to see if we have a Kube service for the specific pool
-func (c *CloudVpc) checkPoolForServiceChanges(updatesRequired []string, pool *VpcLoadBalancerPool, service *v1.Service) ([]string, error) {
+// checkListenerForServiceChanges - check to see if updates are needed to existing listener
+func (c *CloudVpc) checkListenerForServiceChanges(updatesRequired []string, listener *VpcLoadBalancerListener, options *ServiceOptions) []string {
+	// If the listener pool was marked for deletion, don't bother checking anything
+	if listener.DefaultPool.Name == poolToBeDeleted {
+		return updatesRequired
+	}
+	// Verify that the idle connection timeout in the service matches the listener
+	if options.isALB() && options.getIdleConnectionTimeout() != int(listener.IdleConnTimeout) {
+		idleTimeout := fmt.Sprintf("idle:%d-->%d", listener.IdleConnTimeout, options.getIdleConnectionTimeout())
+		updatesRequired = append(updatesRequired, fmt.Sprintf("%s %s %s %s", actionUpdateListener, listener.DefaultPool.Name, listener.ID, idleTimeout))
+	}
+	return updatesRequired
+}
+
+// checkPoolForServiceChanges - check to see if updates are needed to an existing pool
+func (c *CloudVpc) checkPoolForServiceChanges(updatesRequired []string, pool *VpcLoadBalancerPool, service *v1.Service, options *ServiceOptions, servicePortRange string) ([]string, error) {
 	// If the pool was marked for deletion, don't bother checking to see if needs to get updated
 	if pool.Name == poolToBeDeleted {
 		return updatesRequired, nil
@@ -270,19 +307,68 @@ func (c *CloudVpc) checkPoolForServiceChanges(updatesRequired []string, pool *Vp
 	}
 	// Search through the service ports to find a matching external port
 	for _, kubePort := range service.Spec.Ports {
-		if !c.isServicePortEqualPoolName(kubePort, poolNameFields) {
+		if !c.isServicePortEqualPoolName(kubePort, servicePortRange, poolNameFields) {
 			// If this is not the correct Kube service port, move on to the next one
 			continue
 		}
-		poolName := genLoadBalancerPoolName(kubePort)
+		// LoadBalancerOptionLeastConnections / LoadBalancerOptionSessionAffinity are currently not supported
+		// See issue: https://github.ibm.com/alchemy-containers/armada-network/issues/3470
+		//
+		// desiredPersistence := "None"
+		// desiredScheduler := LoadBalancerAlgorithmRoundRobin
+		// if isVpcOptionEnabled(options, LoadBalancerOptionLeastConnections) {
+		// 	desiredScheduler = LoadBalancerAlgorithmLeastConnections
+		// }
+		// if isVpcOptionEnabled(options, LoadBalancerOptionSessionAffinity) {
+		// 	desiredPersistence = LoadBalancerSessionPersistenceSourceIP
+		// }
+		poolName := genLoadBalancerPoolName(kubePort, servicePortRange)
 		updatePool := false
 		replacePoolMembers := false
-		options := c.getServiceOptions(service)
 		proxyProtocolRequested := options.isProxyProtocol()
+		proxyProtocolSupported := !options.isNLB() && !options.isSdnlb()
 		switch {
 		case poolName != pool.Name:
 			updatePool = true
 			replacePoolMembers = true
+
+		case options.getHealthCheckDelay() != int(pool.HealthMonitor.Delay):
+			updatePool = true
+
+		case options.getHealthCheckRetries() != int(pool.HealthMonitor.MaxRetries):
+			updatePool = true
+
+		case options.getHealthCheckTimeout() != int(pool.HealthMonitor.Timeout):
+			updatePool = true
+
+		case options.getHealthCheckProtocol() != "" && options.getHealthCheckProtocol() != pool.HealthMonitor.Type:
+			updatePool = true
+
+		case options.getHealthCheckProtocol() != "" && options.getHealthCheckPort() != 0 && options.getHealthCheckPort() != int(pool.HealthMonitor.Port):
+			updatePool = true
+
+		case (options.getHealthCheckProtocol() == "http" || options.getHealthCheckProtocol() == "https") && options.getHealthCheckPath() != pool.HealthMonitor.URLPath:
+			updatePool = true
+
+		case service.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeCluster &&
+			options.isUDP() && pool.HealthMonitor.Port != int64(options.healthCheckUDP):
+			updatePool = true
+
+		case proxyProtocolSupported && proxyProtocolRequested && pool.ProxyProtocol != LoadBalancerProxyProtocolV1:
+			updatePool = true
+
+		case proxyProtocolSupported && !proxyProtocolRequested && pool.ProxyProtocol != LoadBalancerProxyProtocolDisabled:
+			updatePool = true
+
+		case poolNameFields.isPortRange():
+			// This is a port range pool. Don't bother checking the health check settings. We are never going to update the pool if those change
+			updatePool = false
+
+		// case pool.SessionPersistence != desiredPersistence:
+		// 	updatePool = true
+
+		// case pool.Algorithm != desiredScheduler:
+		// 	updatePool = true
 
 		case service.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeLocal && service.Spec.HealthCheckNodePort > 0 &&
 			(pool.HealthMonitor.Type != LoadBalancerProtocolHTTP || pool.HealthMonitor.Port != int64(service.Spec.HealthCheckNodePort)):
@@ -290,12 +376,6 @@ func (c *CloudVpc) checkPoolForServiceChanges(updatesRequired []string, pool *Vp
 
 		case service.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeCluster &&
 			(pool.HealthMonitor.Type != LoadBalancerProtocolTCP || pool.HealthMonitor.Port != int64(kubePort.NodePort)):
-			updatePool = true
-
-		case proxyProtocolRequested && pool.ProxyProtocol != LoadBalancerProxyProtocolV1:
-			updatePool = true
-
-		case !proxyProtocolRequested && pool.ProxyProtocol != LoadBalancerProxyProtocolDisabled:
 			updatePool = true
 		}
 
@@ -316,70 +396,129 @@ func (c *CloudVpc) CreateLoadBalancer(lbName string, service *v1.Service, nodes 
 		return nil, fmt.Errorf("Required argument is missing")
 	}
 
-	// Validate the service tht was passed in and extract the advanced options requested
+	// Validate the service tht was passed in and the options on that service
 	options, err := c.validateService(service)
 	if err != nil {
 		return nil, err
 	}
+	// Validate the service if sdnlb annotation was specified
+	err = c.validateServiceSdnlb(options)
+	if err != nil {
+		return nil, err
+	}
+	nlbCreate := options.isNLB()
+	sdnlbCreate := options.isSdnlb()
+
+	// Determine what VPC subnets associated with this account
+	vpcSubnets, err := c.Sdk.ListSubnets()
+	if err != nil {
+		return nil, err
+	}
+	serviceName := c.getServiceName(service)
 
 	// Determine what VPC subnets to associate with this load balancer
-	allSubnets, err := c.Sdk.ListSubnets()
+	subnetList, err := c.getSubnetsForLoadBalancer(service, vpcSubnets, options)
 	if err != nil {
 		return nil, err
 	}
-	vpcSubnets := c.filterSubnetsByVpcName(allSubnets, c.Config.VpcName)
-	clusterSubnets := c.filterSubnetsByName(vpcSubnets, c.Config.SubnetNames)
-	if len(clusterSubnets) == 0 {
-		return nil, fmt.Errorf("None of the configured VPC subnets (%s) were found", c.Config.SubnetNames)
+	klog.Infof("%s: subnets: %+v", serviceName, subnetList)
+
+	// If we are creating a NLB, verify multiple subnets were not requested
+	subnetZones := []string{}
+	if nlbCreate {
+		vpcSubnets = c.filterSubnetsBySubnetIDs(vpcSubnets, subnetList)
+		subnetZones = c.getZonesContainingSubnets(vpcSubnets)
+		klog.Infof("%s: subnet zones: %+v", serviceName, subnetZones)
+		if len(subnetZones) > 1 && options.getServiceSubnets() != "" {
+			return nil, fmt.Errorf("Annotation %s on service %s requested subnets in zones: %v, but only one zone is allowed with NLB",
+				serviceAnnotationSubnets, c.getServiceName(service), subnetZones)
+		}
 	}
-	subnetList := c.getSubnetIDs(clusterSubnets)
-	serviceSubnets := options.getServiceSubnets()
-	serviceZone := options.getServiceZone()
-	if serviceSubnets != "" {
-		vpcID := clusterSubnets[0].Vpc.ID
-		subnetList, err = c.validateServiceSubnets(service, serviceSubnets, vpcID, vpcSubnets)
-	} else if serviceZone != "" {
-		subnetList, err = c.validateServiceZone(service, serviceZone, clusterSubnets)
-	}
-	if err != nil {
-		return nil, err
-	}
-	klog.Infof("Subnets: %+v", subnetList)
 
 	// Filter node list by the service annotations (if specified) and node edge label (if set)
-	filterLabel, filterValue := c.getServiceNodeSelectorFilter(service)
+	filterLabel, filterValue, err := c.getServiceNodeSelectorFilter(service)
+	if err != nil {
+		return nil, err
+	}
 	if filterLabel != "" {
 		nodes = c.findNodesMatchingLabelValue(nodes, filterLabel, filterValue)
 	} else {
-		nodes = c.filterNodesByZone(nodes, serviceZone)
+		nodes = c.filterNodesByZone(nodes, options.getServiceZone())
 		nodes = c.filterNodesByEdgeLabel(nodes)
 	}
 	if len(nodes) == 0 {
 		return nil, fmt.Errorf("There are no available nodes for this service")
 	}
 
-	// Determine the IP address for each of the nodes
-	nodeList := c.getNodeIDs(nodes)
-	klog.Infof("Nodes: %v", nodeList)
+	// If we are creating a NLB, make sure that the subnets are only located in a single zone
+	if nlbCreate {
+		subnetList, err = c.selectSingleZoneForSubnet(serviceName, vpcSubnets, subnetZones, nodes)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// If we are creating a sDNLB, validate the worker nodes don't have 10.x.x.x
+	if sdnlbCreate {
+		err = c.validateNodesSdnlb(options, nodes)
+		if err != nil {
+			return nil, err
+		}
+	}
 
-	// Determine what ports are associated with the service
-	klog.Infof("Ports: %+v", service.Spec.Ports)
-	poolList, err := c.getServicePoolNames(service)
+	// Determine the IP address or the VSI instance ID for each of the nodes
+	existingNodes := []string{}
+	nodeList, err := c.filterNodesByServiceMemberQuota(nodes, existingNodes, service, options)
 	if err != nil {
 		return nil, err
 	}
-	klog.Infof("Pools: %+v", poolList)
+	sort.Strings(nodeList)
+	klog.Infof("%s: nodes: %v", serviceName, nodeList)
+
+	// Determine what ports are associated with the service
+	klog.Infof("%s: ports: %+v", serviceName, service.Spec.Ports)
+	poolList, err := c.getServicePoolNames(service, options)
+	if err != nil {
+		return nil, err
+	}
+	klog.Infof("%s: pools: %+v", serviceName, poolList)
+
+	// If this is an ALB, locate the security group to attach to the VPC ALB
+	// This ALB security group attach logic is ignored if we are running in IPI mode
+	if options.isALB() && !c.Config.ipiMode {
+		listNames, err := c.GetSecurityGroupNamesForLBs()
+		if err != nil {
+			return nil, err
+		}
+		secGroup, err := c.FindSecurityGroup(listNames)
+		if err != nil {
+			return nil, err
+		}
+		if secGroup == nil {
+			return nil, fmt.Errorf("Unable to find the security group to attach to the VPC ALB. Perform a Kubernetes master reset to recreate the missing security group")
+		}
+		c.Config.lbSecurityGroupID = secGroup.ID
+	}
 
 	// Create the load balancer
 	lb, err := c.Sdk.CreateLoadBalancer(lbName, nodeList, poolList, subnetList, options)
 	if err != nil {
 		return nil, err
 	}
+
+	// New LB was created. Add the LB to the cache
+	c.Config.addLbToCache(lb)
+
+	// Update the cluster and LBaaS security group rules for this new LB service
+	err = c.CreateSecurityGroupRulesForService(service)
+	if err != nil {
+		return nil, err
+	}
+
 	return lb, nil
 }
 
 // createLoadBalancerListener - create a VPC load balancer listener
-func (c *CloudVpc) createLoadBalancerListener(lb *VpcLoadBalancer, poolName string) error {
+func (c *CloudVpc) createLoadBalancerListener(lb *VpcLoadBalancer, poolName string, options *ServiceOptions) error {
 	poolID := ""
 	for _, pool := range lb.Pools {
 		if poolName == pool.Name {
@@ -390,7 +529,7 @@ func (c *CloudVpc) createLoadBalancerListener(lb *VpcLoadBalancer, poolName stri
 	if poolID == "" {
 		return fmt.Errorf("Unable to create listener. Pool %s not found", poolName)
 	}
-	_, err := c.Sdk.CreateLoadBalancerListener(lb.ID, poolName, poolID)
+	_, err := c.Sdk.CreateLoadBalancerListener(lb.ID, poolName, poolID, options)
 	return err
 }
 
@@ -401,7 +540,7 @@ func (c *CloudVpc) createLoadBalancerPool(lb *VpcLoadBalancer, poolName string, 
 }
 
 // createLoadBalancerPoolMember - create a VPC load balancer pool member
-func (c *CloudVpc) createLoadBalancerPoolMember(lb *VpcLoadBalancer, args string) error {
+func (c *CloudVpc) createLoadBalancerPoolMember(lb *VpcLoadBalancer, args string, options *ServiceOptions) error {
 	argsArray := strings.Fields(args)
 	if lb == nil || len(argsArray) != 3 {
 		return fmt.Errorf("Required argument is missing")
@@ -409,7 +548,7 @@ func (c *CloudVpc) createLoadBalancerPoolMember(lb *VpcLoadBalancer, args string
 	poolName := argsArray[0]
 	poolID := argsArray[1]
 	nodeID := argsArray[2]
-	_, err := c.Sdk.CreateLoadBalancerPoolMember(lb.ID, poolName, poolID, nodeID)
+	_, err := c.Sdk.CreateLoadBalancerPoolMember(lb.ID, poolName, poolID, nodeID, options)
 	return err
 }
 
@@ -418,7 +557,19 @@ func (c *CloudVpc) DeleteLoadBalancer(lb *VpcLoadBalancer, service *v1.Service) 
 	if lb == nil {
 		return fmt.Errorf("Required argument is missing")
 	}
-	return c.Sdk.DeleteLoadBalancer(lb.ID)
+	// Update the cluster and LBaaS security group rules for this deleted LB service
+	if service != nil {
+		err := c.DeleteSecurityGroupRulesForService(service)
+		if err != nil {
+			return err
+		}
+	}
+	// Delete the VPC LB
+	err := c.Sdk.DeleteLoadBalancer(lb.ID, c.getServiceOptions(service))
+
+	// Since delete has been called, remove the LB from the cache (if it exists)
+	c.Config.removeLbFromCache(lb)
+	return err
 }
 
 // deleteLoadBalancerListener - delete a VPC load balancer listener
@@ -461,46 +612,117 @@ func (c *CloudVpc) FindLoadBalancer(nameID string, service *v1.Service) (*VpcLoa
 	if nameID == "" {
 		return nil, fmt.Errorf("Required argument is missing")
 	}
+	id := c.Config.searchCacheForLb(nameID)
+	if id != "" {
+		lb, err := c.Sdk.GetLoadBalancer(id)
+		if lb != nil && err == nil && lb.Name == nameID {
+			return lb, nil
+		}
+		// Failed to retrieve LB from the cached ID. Remove the id from the cache
+		c.Config.removeLbNameFromCache(nameID)
+	}
+	return c.Sdk.FindLoadBalancer(nameID, c.getServiceOptions(service))
+}
+
+// getLoadBalancersInCluster - locate all of the VPC load balancers in the current cluster
+func (c *CloudVpc) getLoadBalancersInCluster() ([]*VpcLoadBalancer, error) {
 	lbs, err := c.Sdk.ListLoadBalancers()
 	if err != nil {
 		return nil, err
 	}
+	clusterLbs := []*VpcLoadBalancer{}
+	prefix := VpcLbNamePrefix + "-" + c.Config.ClusterID
 	for _, lb := range lbs {
-		if nameID == lb.ID || nameID == lb.Name || nameID == lb.Hostname {
-			return lb, nil
+		if strings.HasPrefix(lb.Name, prefix) {
+			clusterLbs = append(clusterLbs, lb)
 		}
 	}
-	return nil, nil
+	// Return list of lbs in the current cluster
+	return clusterLbs, nil
 }
 
 // GetLoadBalancerStatus returns the load balancer status for a given VPC host name
 func (c *CloudVpc) GetLoadBalancerStatus(service *v1.Service, lb *VpcLoadBalancer) *v1.LoadBalancerStatus {
 	lbStatus := &v1.LoadBalancerStatus{}
-	lbStatus.Ingress = []v1.LoadBalancerIngress{{Hostname: lb.Hostname}}
+	hostname := lb.Hostname
+	if hostname == "" {
+		for _, ipArrayItem := range lb.PrivateIps {
+			ipArrayItem = strings.TrimSpace(ipArrayItem)
+			ingressObject := v1.LoadBalancerIngress{IP: ipArrayItem}
+			lbStatus.Ingress = append(lbStatus.Ingress, ingressObject)
+		}
+		return lbStatus
+	}
+	lbStatus.Ingress = []v1.LoadBalancerIngress{{Hostname: hostname}}
+	options := c.getServiceOptions(service)
+	if options.isNLB() {
+		// If the hostname and static IP address are already stored in the service, then don't
+		// repeat the overhead of the DNS hostname resolution again
+		if service.Status.LoadBalancer.Ingress != nil &&
+			len(service.Status.LoadBalancer.Ingress) == 1 &&
+			service.Status.LoadBalancer.Ingress[0].Hostname == hostname &&
+			service.Status.LoadBalancer.Ingress[0].IP != "" {
+			lbStatus.Ingress[0].IP = service.Status.LoadBalancer.Ingress[0].IP
+		} else {
+			ipAddrs, err := net.LookupIP(hostname)
+			if err == nil && len(ipAddrs) > 0 {
+				lbStatus.Ingress[0].IP = ipAddrs[0].String()
+			}
+		}
+	}
 	return lbStatus
 }
 
+// processUpdate - perform the given update operation
+func (c *CloudVpc) processUpdate(lb *VpcLoadBalancer, update string, index, total int, nodeList, subnetList []string, pools []*VpcLoadBalancerPool, options *ServiceOptions) error {
+	// Process the current update
+	var err error
+	klog.Infof("%s: processing update [%d of %d]: %s", options.getServiceName(), index+1, total, update)
+	action := strings.Fields(update)[0]
+	args := strings.TrimSpace(strings.TrimPrefix(update, action))
+	switch action {
+	case actionCreateListener:
+		err = c.createLoadBalancerListener(lb, args, options)
+	case actionCreatePool:
+		err = c.createLoadBalancerPool(lb, args, nodeList, options)
+	case actionCreatePoolMember:
+		err = c.createLoadBalancerPoolMember(lb, args, options)
+	case actionDeleteListener:
+		err = c.deleteLoadBalancerListener(lb, args)
+	case actionDeletePool:
+		err = c.deleteLoadBalancerPool(lb, args)
+	case actionDeletePoolMember:
+		err = c.deleteLoadBalancerPoolMember(lb, args)
+	case actionReplacePoolMembers:
+		err = c.replaceLoadBalancerPoolMembers(lb, args, nodeList, options)
+	case actionUpdateListener:
+		err = c.updateLoadBalancerListener(lb, args, options)
+	case actionUpdatePool:
+		err = c.updateLoadBalancerPool(lb, args, pools, options)
+	case actionUpdateSubnets:
+		err = c.updateLoadBalancerSubnets(lb, subnetList, options)
+	default:
+		err = fmt.Errorf("Unsupported update operation: %s", update)
+	}
+	return err
+}
+
 // replaceLoadBalancerPoolMembers - replace the load balancer pool members
-func (c *CloudVpc) replaceLoadBalancerPoolMembers(lb *VpcLoadBalancer, args string, nodeList []string) error {
+func (c *CloudVpc) replaceLoadBalancerPoolMembers(lb *VpcLoadBalancer, args string, nodeList []string, options *ServiceOptions) error {
 	argsArray := strings.Fields(args)
 	if lb == nil || len(argsArray) != 2 {
 		return fmt.Errorf("Required argument is missing")
 	}
 	poolName := argsArray[0]
 	poolID := argsArray[1]
-	_, err := c.Sdk.ReplaceLoadBalancerPoolMembers(lb.ID, poolName, poolID, nodeList)
+	_, err := c.Sdk.ReplaceLoadBalancerPoolMembers(lb.ID, poolName, poolID, nodeList, options)
 	return err
 }
 
 // UpdateLoadBalancer - update a VPC load balancer
 func (c *CloudVpc) UpdateLoadBalancer(lb *VpcLoadBalancer, service *v1.Service, nodes []*v1.Node) (*VpcLoadBalancer, error) {
-	if lb == nil || service == nil || nodes == nil {
+	if service == nil || nodes == nil {
 		return nil, fmt.Errorf("Required argument is missing")
-	}
-
-	// Verify that the load balancer is in the correct state
-	if !lb.IsReady() {
-		return nil, fmt.Errorf("Update can not be performed, load balancer is not ready: %v", lb.GetStatus())
 	}
 
 	// Validate the service tht was passed in and extract the advanced options requested
@@ -508,12 +730,60 @@ func (c *CloudVpc) UpdateLoadBalancer(lb *VpcLoadBalancer, service *v1.Service, 
 	if err != nil {
 		return nil, err
 	}
+	err = c.validateServiceSdnlb(options)
+	if err != nil {
+		return nil, err
+	}
+	if lb == nil {
+		return nil, fmt.Errorf("Load balancer not found")
+	}
+	nlbUpdate := options.isNLB()
+	sdnlbUpdate := options.isSdnlb()
+	serviceName := c.getServiceName(service)
 
 	// If the service has been changed from public to private (or vice-versa)
 	// If the service has been changed to a network load balancer (or vice versa)
 	err = c.validateServiceTypeNotUpdated(options, lb)
 	if err != nil {
 		return nil, err
+	}
+	err = c.validateServiceSdnlbNotUpdated(options, lb)
+	if err != nil {
+		return nil, err
+	}
+
+	// Obtain mutex to serialize access to the updates for this LB
+	mutex := vpcMapUpdateMutex[lb.ID]
+	if mutex == nil {
+		mutex = &sync.Mutex{}
+		vpcMapUpdateMutex[lb.ID] = mutex
+	}
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	// Check to see if async update is already in progress
+	done := vpcMapAsyncUpdates[lb.ID]
+	if done != nil {
+		klog.Infof("%s: wait for the async updates to complete", serviceName)
+		select {
+		case <-done:
+			klog.Infof("%s: async updates are complete", serviceName)
+			delete(vpcMapAsyncUpdates, lb.ID)
+			lb, err = c.Sdk.GetLoadBalancer(lb.ID)
+			if err != nil {
+				return nil, err
+			}
+		case <-time.After(time.Minute):
+			klog.Infof("%s: async updates are still being processed", serviceName)
+			lb.OperatingStatus = LoadBalancerOperatingStatusOnline
+			lb.ProvisioningStatus = LoadBalancerProvisioningStatusUpdatePending
+			return lb, fmt.Errorf("Updates are being performed, load balancer not ready")
+		}
+	}
+
+	// Verify that the load balancer is in the correct state
+	if !lb.IsReady() {
+		return lb, fmt.Errorf("Update can not be performed, load balancer not ready: %v", lb.GetStatus())
 	}
 
 	// Retrieve list of all VPC subnets
@@ -522,22 +792,52 @@ func (c *CloudVpc) UpdateLoadBalancer(lb *VpcLoadBalancer, service *v1.Service, 
 		return nil, err
 	}
 
+	subnetList := []string{}
 	// If the VPC subnets annotation on the service has been changed, detect this case and return error
-	err = c.validateServiceSubnetsNotUpdated(service, lb, vpcSubnets)
-	if err != nil {
-		return nil, err
+	if nlbUpdate {
+		err = c.validateServiceSubnetsNotUpdated(service, lb, vpcSubnets)
+		if err != nil {
+			return nil, err
+		}
+	} else if !sdnlbUpdate {
+		// Check to see if the subnets of the VPC ALB need to be updated
+		subnetList, err = c.getUpdatedSubnetsForForLoadBalancer(service, lb, vpcSubnets, options)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Verify that there are nodes available to associate with this load balancer
-	filterLabel, filterValue := c.getServiceNodeSelectorFilter(service)
+	serviceZone := options.getServiceZone()
+	filterLabel, filterValue, err := c.getServiceNodeSelectorFilter(service)
+	if err != nil {
+		return nil, err
+	}
 	if filterLabel != "" {
 		nodes = c.findNodesMatchingLabelValue(nodes, filterLabel, filterValue)
 	} else {
-		nodes = c.filterNodesByZone(nodes, options.getServiceZone())
+		nodes = c.filterNodesByZone(nodes, serviceZone)
 		nodes = c.filterNodesByEdgeLabel(nodes)
 	}
 	if len(nodes) == 0 {
 		return nil, fmt.Errorf("There are no available nodes for this load balancer")
+	}
+
+	// If this is a network load balancer, verify zone has not changed
+	if nlbUpdate {
+		// Verify that the zone was not changed
+		lbZones := lb.getZones(vpcSubnets)
+		err = c.validateServiceZoneNotUpdated(serviceZone, lbZones)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// If we are updated a sDNLB, validate the worker nodes don't have 10.x.x.x
+	if sdnlbUpdate {
+		err = c.validateNodesSdnlb(options, nodes)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Retrieve list of listeners for the current load balancer
@@ -552,8 +852,28 @@ func (c *CloudVpc) UpdateLoadBalancer(lb *VpcLoadBalancer, service *v1.Service, 
 		return nil, err
 	}
 
-	// Determine the node list
-	nodeList := c.getNodeIDs(nodes)
+	// Verify that we did not exceed quota for number of load balancer pool members
+	existingNodes := []string{}
+	if len(pools) > 0 {
+		existingNodes = c.getPoolMemberTargets(pools[0].Members, options)
+	}
+	nodeList, err := c.filterNodesByServiceMemberQuota(nodes, existingNodes, service, options)
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(nodeList)
+	klog.Infof("%s: nodes: %v", serviceName, nodeList)
+
+	// Validate the port range annotation on the service (if it set)
+	servicePortRange, err := c.validateServicePortRange(service, options)
+	if err != nil {
+		return nil, err
+	}
+	// Generate list of pool names for the service ports
+	poolList := []string{}
+	for _, kubePort := range service.Spec.Ports {
+		poolList = append(poolList, genLoadBalancerPoolName(kubePort, servicePortRange))
+	}
 
 	// The following array is going to be used to keep track of ALL of the updates that need to be done
 	// There will be 1 line of text for each update that needs to be done.
@@ -561,7 +881,8 @@ func (c *CloudVpc) UpdateLoadBalancer(lb *VpcLoadBalancer, service *v1.Service, 
 	// The rest of the line will contain all of the necessary options needed to perform that update (space separated)
 	// The arguments for each operation will be different
 	// Care must be taken to ensure that the arg string is consistently ordered/handle by both the caller and the called function
-	// Update operations must be performed in a specific order.  Rules concering the supported operations:
+	// Update operations must be performed in a specific order.  Rules concerning the supported operations:
+	//   0. Verify customer did not edit/corrupt the VPC LB pool names
 	//   1. DELETE-LISTENER must be done before the pool can be cleaned up with DELETE-POOL
 	//   2. CREATE-POOL must be done before the pool can be referenced by an CREATE-LISTENER
 	//   3. CREATE-LISTENER can not be done for an external port that is being used by an existing listener
@@ -573,14 +894,17 @@ func (c *CloudVpc) UpdateLoadBalancer(lb *VpcLoadBalancer, service *v1.Service, 
 	//   9. The load balancer object is never updated or modified.  All update processing is done on the listeners, pools, and members
 	updatesRequired := []string{}
 
+	// Step 0: Verify that the VPC LB pool names were not corrupted by the customer
+	updatesRequired = c.verifyVpcPoolNamesAreValid(updatesRequired, listeners, pools)
+
 	// Step 1: Delete the VPC LB listener if the Kube service external port was deleted
 	for _, listener := range listeners {
-		updatesRequired = c.checkListenerForExtPortDeletedFromService(updatesRequired, listener, service.Spec.Ports)
+		updatesRequired = c.checkListenerForExtPortDeletedFromService(updatesRequired, listener, service.Spec.Ports, servicePortRange)
 	}
 
 	// Step 2: Delete the VPC LB pool if the Kube service external port was deleted
 	for _, pool := range pools {
-		updatesRequired, err = c.checkPoolForExtPortDeletedFromService(updatesRequired, pool, service.Spec.Ports)
+		updatesRequired, err = c.checkPoolForExtPortDeletedFromService(updatesRequired, pool, service.Spec.Ports, servicePortRange)
 		if err != nil {
 			return nil, err
 		}
@@ -588,15 +912,20 @@ func (c *CloudVpc) UpdateLoadBalancer(lb *VpcLoadBalancer, service *v1.Service, 
 
 	// Step 3: Delete VPC LB pool members for any nodes that are no longer in the cluster
 	for _, pool := range pools {
-		updatesRequired, err = c.checkPoolForNodesToDelete(updatesRequired, pool, service.Spec.Ports, nodeList)
+		updatesRequired, err = c.checkPoolForNodesToDelete(updatesRequired, pool, service.Spec.Ports, nodeList, nlbUpdate || sdnlbUpdate, servicePortRange)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	// Step 4: Update the existing pools and pool members if the Kube service node port was changed -OR- if the externalTrafficPolicy was changed
+	// Step 4.1: Update the existing listeners if the Kube service was changed - idle connection timeout annotation
+	for _, listener := range listeners {
+		updatesRequired = c.checkListenerForServiceChanges(updatesRequired, listener, options)
+	}
+
+	// Step 4.2: Update the existing pools and pool members if the Kube service node port was changed -OR- if the externalTrafficPolicy was changed
 	for _, pool := range pools {
-		updatesRequired, err = c.checkPoolForServiceChanges(updatesRequired, pool, service)
+		updatesRequired, err = c.checkPoolForServiceChanges(updatesRequired, pool, service, options, servicePortRange)
 		if err != nil {
 			return nil, err
 		}
@@ -604,7 +933,7 @@ func (c *CloudVpc) UpdateLoadBalancer(lb *VpcLoadBalancer, service *v1.Service, 
 
 	// Step 5: Create new VPC LB pool members if new nodes were added to the cluster
 	for _, pool := range pools {
-		updatesRequired, err = c.checkPoolForNodesToAdd(updatesRequired, pool, service.Spec.Ports, nodeList)
+		updatesRequired, err = c.checkPoolForNodesToAdd(updatesRequired, pool, service.Spec.Ports, nodeList, nlbUpdate || sdnlbUpdate, servicePortRange)
 		if err != nil {
 			return nil, err
 		}
@@ -612,32 +941,67 @@ func (c *CloudVpc) UpdateLoadBalancer(lb *VpcLoadBalancer, service *v1.Service, 
 
 	// Step 6: Create a new VPC LB pool if a new external port was added to the Kube service
 	for _, servicePort := range service.Spec.Ports {
-		updatesRequired, err = c.checkPoolsForExtPortAddedToService(updatesRequired, pools, servicePort)
+		updatesRequired, err = c.checkPoolsForExtPortAddedToService(updatesRequired, pools, servicePort, servicePortRange)
 		if err != nil {
 			return nil, err
 		}
 
 		// Step 7: Create a new VPC LB listener if a new external port was added to the Kube service
-		updatesRequired = c.checkListenersForExtPortAddedToService(updatesRequired, listeners, servicePort)
+		updatesRequired = c.checkListenersForExtPortAddedToService(updatesRequired, listeners, servicePort, servicePortRange)
 	}
 
-	// Step 8: Replace multiple CREATE-POOL-MEMBER / DELETE-POOL-MEMBER actions with a single REPLACE-POOL-MEMBERS
-	updatesRequired = c.checkForMultiplePoolMemberUpdates(updatesRequired)
+	// Step 8: Check to see if VPC ALB subnets need to get updated
+	if len(subnetList) > 0 {
+		updatesRequired = append(updatesRequired, fmt.Sprintf("%s %s", actionUpdateSubnets, strings.Join(subnetList, ",")))
+	}
+
+	// Update the cluster and LBaaS security group rules (if needed)
+	err = c.UpdateSecurityGroupRulesForService(service)
+	if err != nil {
+		return nil, err
+	}
 
 	// If no updates are required, then return
 	if len(updatesRequired) == 0 {
-		klog.Infof("No updates needed")
+		klog.Infof("%s: no updates needed", serviceName)
 		return lb, nil
 	}
 
 	// Display list of all required updates
 	for i, update := range updatesRequired {
-		klog.Infof("Updates required [%d]: %s", i+1, update)
+		klog.Infof("%s: updates required [%d]: %s", serviceName, i+1, update)
 	}
 
-	// Set sleep and max wait times.  Increase times if NLB
-	maxWaitTime := 2 * 60
-	minSleepTime := 8
+	// Step 8: Replace multiple CREATE-POOL-MEMBER / DELETE-POOL-MEMBER actions with a single REPLACE-POOL-MEMBERS
+	updateCount := len(updatesRequired)
+	updatesRequired = c.checkForMultiplePoolMemberUpdates(updatesRequired)
+	if updateCount > len(updatesRequired) {
+		klog.Infof("%s: number of updates reduced from: %d to %d", serviceName, updateCount, len(updatesRequired))
+	}
+
+	// Inform the SDK layer that updates are coming
+	err = c.Sdk.UpdateLoadBalancer(lb.ID, updatesRequired, nodeList, poolList, options)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set min sleep and max wait times. Increase times for NLB
+	maxWait := 2 * 60
+	minSleep := 8
+	if lb.IsNLB() {
+		maxWait = 3 * 60
+		minSleep = 14
+	} else if lb.IsService {
+		minSleep = 2
+	}
+
+	// Determine if updates should be handled asynchronously
+	//  - if Go routines are allowed
+	//  - if there is more than one LB associated with this cluster
+	asyncUpdate := false
+	if VpcGoRoutinesAllowed && len(c.Config.lbNameCache) > 1 {
+		asyncUpdate = true
+	}
 
 	// Process all of the updates that are needed
 	for i, update := range updatesRequired {
@@ -649,49 +1013,90 @@ func (c *CloudVpc) UpdateLoadBalancer(lb *VpcLoadBalancer, service *v1.Service, 
 			}
 			// Wait for the LB to be "ready" before performing the actual update
 			if !lb.IsReady() {
-				lb, err = c.WaitLoadBalancerReady(lb, minSleepTime, maxWaitTime)
+				// If async update is enabled, then create async GO routine for the rest of the updates
+				if asyncUpdate {
+					klog.Infof("%s: load balancer not ready: %s. Use async thread for the [%d] remaining updates", serviceName, lb.GetStatus(), len(updatesRequired)-i)
+					go c.updateLoadBalancerAsync(lb, i, minSleep, nodeList, subnetList, updatesRequired, pools, options)
+					return lb, fmt.Errorf("load balancer not ready: %s", lb.GetStatus())
+				}
+				lb, err = c.WaitLoadBalancerReady(lb, minSleep, maxWait, true)
 				if err != nil {
 					return nil, err
 				}
 			}
 		}
-
 		// Process the current update
-		klog.Infof("Processing update [%d]: %s", i+1, update)
-		action := strings.Fields(update)[0]
-		args := strings.TrimSpace(strings.TrimPrefix(update, action))
-		switch action {
-		case actionCreateListener:
-			err = c.createLoadBalancerListener(lb, args)
-		case actionCreatePool:
-			err = c.createLoadBalancerPool(lb, args, nodeList, options)
-		case actionCreatePoolMember:
-			err = c.createLoadBalancerPoolMember(lb, args)
-		case actionDeleteListener:
-			err = c.deleteLoadBalancerListener(lb, args)
-		case actionDeletePool:
-			err = c.deleteLoadBalancerPool(lb, args)
-		case actionDeletePoolMember:
-			err = c.deleteLoadBalancerPoolMember(lb, args)
-		case actionUpdatePool:
-			err = c.updateLoadBalancerPool(lb, args, pools, options)
-		case actionReplacePoolMembers:
-			err = c.replaceLoadBalancerPoolMembers(lb, args, nodeList)
-		default:
-			err = fmt.Errorf("Unsupported update operation: %s", update)
-		}
-		// If update operation failed, return err
+		err = c.processUpdate(lb, update, i, len(updatesRequired), nodeList, subnetList, pools, options)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	// Return the updated load balancer
-	klog.Infof("Done with updates")
+	klog.Infof("%s: done with updates ", serviceName)
 	return lb, nil
 }
 
-// updateLoadBalancerPool - create a VPC load balancer pool
+// updateLoadBalancerAsync - asynchronously finish making updates to a a VPC load balancer
+func (c *CloudVpc) updateLoadBalancerAsync(lb *VpcLoadBalancer, index, minSleep int, nodeList, subnetList, updateList []string, pools []*VpcLoadBalancerPool, options *ServiceOptions) {
+	// Initialize config so that subsequent update-LB attempts can see this update is still in progress
+	serviceName := options.getServiceName()
+	klog.Infof("%s: starting async updates", serviceName)
+	done := make(chan string)
+	vpcMapAsyncUpdates[lb.ID] = done
+	defer close(done)
+
+	// Add one more update to force a final get-lb/wait-lb to be done so that
+	// and pending update-lb will not still see the online/update-pending state
+	updateList = append(updateList, "Done with updates")
+
+	// Process all of the updates that need to be done
+	var err error
+	for i, update := range updateList {
+		// Skip over the updates that were already done
+		if i < index {
+			continue
+		}
+		// Wait for the LB to be "ready" before performing the actual update
+		if !lb.IsReady() {
+			lb, err = c.WaitLoadBalancerReady(lb, minSleep, 60*5, false) // Max wait of 5 min for the last operation to complete
+			if err != nil {
+				return
+			}
+		}
+		// Check to see if we are done with updates
+		if update == "Done with updates" {
+			break
+		}
+		// Process the update
+		err = c.processUpdate(lb, update, i, len(updateList)-1, nodeList, subnetList, pools, options)
+		if err != nil {
+			return
+		}
+		// Check the status of the LB
+		lb, err = c.Sdk.GetLoadBalancer(lb.ID)
+		if err != nil {
+			return
+		}
+	}
+	// Return the updated load balancer
+	klog.Infof("%s: done with async updates", serviceName)
+}
+
+// updateLoadBalancerListener - update a VPC load balancer listener
+func (c *CloudVpc) updateLoadBalancerListener(lb *VpcLoadBalancer, args string, options *ServiceOptions) error {
+	argsArray := strings.Fields(args)
+	if lb == nil || len(argsArray) != 3 {
+		return fmt.Errorf("Required argument is missing")
+	}
+	// poolName := argsArray[0] - only included so that it shows up in the logs
+	listenerID := argsArray[1]
+	// timeout := argsArray[2] - only included so that it shows up in the logs
+	_, err := c.Sdk.UpdateLoadBalancerListener(lb.ID, listenerID, options)
+	return err
+}
+
+// updateLoadBalancerPool - update a VPC load balancer pool
 func (c *CloudVpc) updateLoadBalancerPool(lb *VpcLoadBalancer, args string, pools []*VpcLoadBalancerPool, options *ServiceOptions) error {
 	argsArray := strings.Fields(args)
 	if lb == nil || len(argsArray) != 2 {
@@ -713,19 +1118,82 @@ func (c *CloudVpc) updateLoadBalancerPool(lb *VpcLoadBalancer, args string, pool
 	return err
 }
 
+// updateLoadBalancerSubnets - update the subnets associated with VPC ALB
+func (c *CloudVpc) updateLoadBalancerSubnets(lb *VpcLoadBalancer, subnetList []string, options *ServiceOptions) error {
+	_, err := c.Sdk.UpdateLoadBalancerSubnets(lb.ID, subnetList, options)
+	return err
+}
+
+// verifyVpcListenerDefaultPoolName - verify that the VPC listener's default pool name is correct
+func (c *CloudVpc) verifyVpcPoolNamesAreValid(updatesRequired []string, listeners []*VpcLoadBalancerListener, pools []*VpcLoadBalancerPool) []string {
+	// Check each of the VPC listeners on this VPC load balancer
+	for _, listener := range listeners {
+		// Verify we don't have "" for the listener's default pool name
+		poolName := listener.DefaultPool.Name
+		if poolName == "" {
+			updatesRequired = append(updatesRequired, fmt.Sprintf("%s %s %s", actionDeleteListener, "unknown", listener.ID))
+			listener.DefaultPool.Name = poolToBeDeleted
+			continue
+		}
+		// Verify that the listeners default pool name is correctly formatted
+		poolNameFields, err := extractFieldsFromPoolName(poolName)
+		if err != nil {
+			updatesRequired = append(updatesRequired, fmt.Sprintf("%s %s %s", actionDeleteListener, poolName, listener.ID))
+			listener.DefaultPool.Name = poolToBeDeleted
+			continue
+		}
+		// Verify that the listener protocol and port(s) are correct in the pool name
+		if listener.Protocol != poolNameFields.Protocol || listener.PortMin != int64(poolNameFields.PortMin) || listener.PortMax != int64(poolNameFields.PortMax) {
+			updatesRequired = append(updatesRequired, fmt.Sprintf("%s %s %s", actionDeleteListener, poolName, listener.ID))
+			listener.DefaultPool.Name = poolToBeDeleted
+			// Locate the associated pool and delete it as well.
+			for _, pool := range pools {
+				if poolName == pool.Name {
+					updatesRequired = append(updatesRequired, fmt.Sprintf("%s %s %s", actionDeletePool, pool.Name, pool.ID))
+					pool.Name = poolToBeDeleted
+					break
+				}
+			}
+		}
+	}
+	// Check each of the VPC pools on this VPC load balancer
+	for _, pool := range pools {
+		// If the pool was marked for deletion, don't bother checking anything else
+		if pool.Name == poolToBeDeleted {
+			continue
+		}
+		// Check to see if the pool name was corrupted (will only be true if there is no listener for this pool)
+		poolNameFields, err := extractFieldsFromPoolName(pool.Name)
+		if err != nil {
+			updatesRequired = append(updatesRequired, fmt.Sprintf("%s %s %s", actionDeletePool, pool.Name, pool.ID))
+			pool.Name = poolToBeDeleted
+			continue
+		}
+		// Verify that the protocol is the same in the pool and the pool name. External port and node port will be checked later
+		if pool.Protocol != poolNameFields.Protocol {
+			updatesRequired = append(updatesRequired, fmt.Sprintf("%s %s %s", actionDeletePool, pool.Name, pool.ID))
+			pool.Name = poolToBeDeleted
+		}
+	}
+	// Return with the updates
+	return updatesRequired
+}
+
 // WaitLoadBalancerReady will call the Get() operation on the load balancer every minSleep seconds until the state
 // of the load balancer goes to Online/Active -OR- until the maxWait timeout occurs
-func (c *CloudVpc) WaitLoadBalancerReady(lb *VpcLoadBalancer, minSleep, maxWait int) (*VpcLoadBalancer, error) {
+func (c *CloudVpc) WaitLoadBalancerReady(lb *VpcLoadBalancer, minSleep, maxWait int, logStatus bool) (*VpcLoadBalancer, error) {
 	// Wait for the load balancer to Online/Active
 	var err error
 	lbID := lb.ID
 	startTime := time.Now()
 	for i := 0; i < (maxWait / minSleep); i++ {
-		suffix := ""
-		if lb.ProvisioningStatus == LoadBalancerProvisioningStatusCreatePending {
-			suffix = fmt.Sprintf(" Public:%s Private:%s", strings.Join(lb.PublicIps, ","), strings.Join(lb.PrivateIps, ","))
+		if logStatus {
+			suffix := ""
+			if lb.ProvisioningStatus == LoadBalancerProvisioningStatusCreatePending {
+				suffix = fmt.Sprintf(" Public:%s Private:%s", strings.Join(lb.PublicIps, ","), strings.Join(lb.PrivateIps, ","))
+			}
+			klog.Infof(" %3d) %9s %s%s", i+1, time.Since(startTime).Round(time.Millisecond), lb.GetStatus(), suffix)
 		}
-		klog.Infof(" %3d) %9s %s%s", i+1, time.Since(startTime).Round(time.Millisecond), lb.GetStatus(), suffix)
 		if lb.IsReady() {
 			return lb, nil
 		}
@@ -738,6 +1206,10 @@ func (c *CloudVpc) WaitLoadBalancerReady(lb *VpcLoadBalancer, minSleep, maxWait 
 			klog.Errorf("Failed to get load balancer %v: %v", lbID, err)
 			return nil, err
 		}
+	}
+	// If LB is actually ready, don't return error that it is not
+	if lb.IsReady() {
+		return lb, nil
 	}
 	return lb, fmt.Errorf("load balancer not ready: %s", lb.GetStatus())
 }

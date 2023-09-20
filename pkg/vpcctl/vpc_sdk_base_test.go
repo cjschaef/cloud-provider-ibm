@@ -1,6 +1,6 @@
 /*******************************************************************************
 * IBM Cloud Kubernetes Service, 5737-D43
-* (C) Copyright IBM Corp. 2021, 2022 All Rights Reserved.
+* (C) Copyright IBM Corp. 2021, 2023 All Rights Reserved.
 *
 * SPDX-License-Identifier: Apache2.0
 *
@@ -30,44 +30,57 @@ import (
 
 func TestExtractPortsFromPoolName(t *testing.T) {
 	// Invalid pool name
-	protocol, port, nodePort, err := extractProtocolPortsFromPoolName("poolName")
+	protocol, portMin, portMax, nodePort, err := extractProtocolPortsFromPoolName("poolName")
 	assert.Equal(t, protocol, "")
-	assert.Equal(t, port, -1)
+	assert.Equal(t, portMin, -1)
+	assert.Equal(t, portMax, -1)
 	assert.Equal(t, nodePort, -1)
 	assert.NotNil(t, err)
 
 	// Invalid protocol
-	protocol, port, nodePort, err = extractProtocolPortsFromPoolName("sctp-80-31234")
+	protocol, portMin, portMax, nodePort, err = extractProtocolPortsFromPoolName("sctp-80-31234")
 	assert.Equal(t, protocol, "")
-	assert.Equal(t, port, -1)
+	assert.Equal(t, portMin, -1)
+	assert.Equal(t, portMax, -1)
 	assert.Equal(t, nodePort, -1)
 	assert.NotNil(t, err)
 
 	// Invalid port
-	protocol, port, nodePort, err = extractProtocolPortsFromPoolName("tcp-abc-31234")
+	protocol, portMin, portMax, nodePort, err = extractProtocolPortsFromPoolName("tcp-abc-31234")
 	assert.Equal(t, protocol, "")
-	assert.Equal(t, port, -1)
+	assert.Equal(t, portMin, -1)
+	assert.Equal(t, portMax, -1)
 	assert.Equal(t, nodePort, -1)
 	assert.NotNil(t, err)
 
 	// Invalid nodePort
-	protocol, port, nodePort, err = extractProtocolPortsFromPoolName("tcp-80-xyz")
+	protocol, portMin, portMax, nodePort, err = extractProtocolPortsFromPoolName("tcp-80-xyz")
 	assert.Equal(t, protocol, "")
-	assert.Equal(t, port, -1)
+	assert.Equal(t, portMin, -1)
+	assert.Equal(t, portMax, -1)
 	assert.Equal(t, nodePort, -1)
 	assert.NotNil(t, err)
 
-	// Success
-	protocol, port, nodePort, err = extractProtocolPortsFromPoolName("tcp-80-31234")
+	// Success - single port
+	protocol, portMin, portMax, nodePort, err = extractProtocolPortsFromPoolName("tcp-80-31234")
 	assert.Equal(t, protocol, "tcp")
-	assert.Equal(t, port, 80)
+	assert.Equal(t, portMin, 80)
+	assert.Equal(t, portMax, 80)
+	assert.Equal(t, nodePort, 31234)
+	assert.Nil(t, err)
+
+	// Success - port range
+	protocol, portMin, portMax, nodePort, err = extractProtocolPortsFromPoolName("tcp-80x88-31234")
+	assert.Equal(t, protocol, "tcp")
+	assert.Equal(t, portMin, 80)
+	assert.Equal(t, portMax, 88)
 	assert.Equal(t, nodePort, 31234)
 	assert.Nil(t, err)
 }
 
 func TestGenLoadBalancerPoolName(t *testing.T) {
 	kubePort := v1.ServicePort{Protocol: "TCP", Port: 80, NodePort: 31234}
-	result := genLoadBalancerPoolName(kubePort)
+	result := genLoadBalancerPoolName(kubePort, "")
 	assert.Equal(t, result, "tcp-80-31234")
 }
 
@@ -83,40 +96,101 @@ func TestGetServiceOptions(t *testing.T) {
 	mockCloud := &CloudVpc{}
 	mockService := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
+			Name:      "echo-server",
+			Namespace: "default",
 			Annotations: map[string]string{
-				serviceAnnotationEnableFeatures: LoadBalancerOptionProxyProtocol,
-				serviceAnnotationIPType:         servicePrivateLB,
-				serviceAnnotationSubnets:        "vpc-subnets",
-				serviceAnnotationZone:           "us-south-1",
+				serviceAnnotationEnableFeatures:      LoadBalancerOptionNLB,
+				serviceAnnotationHealthCheckDelay:    "10",
+				serviceAnnotationHealthCheckProtocol: "https",
+				serviceAnnotationHealthCheckPort:     "443",
+				serviceAnnotationHealthCheckPath:     "/health",
+				serviceAnnotationHealthCheckRetries:  "5",
+				serviceAnnotationHealthCheckTimeout:  "4",
+				serviceAnnotationHealthCheckUDP:      "10250",
+				serviceAnnotationIPType:              servicePrivateLB,
+				serviceAnnotationServiceCRN:          "serviceCRN",
+				serviceAnnotationSubnets:             "vpc-subnets",
+				serviceAnnotationZone:                "us-south-1",
 			}},
 		Spec: v1.ServiceSpec{
 			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 			HealthCheckNodePort:   36963,
-		}}
+			Ports: []v1.ServicePort{
+				{Protocol: v1.ProtocolUDP, Port: 80, NodePort: 30123},
+				{Protocol: v1.ProtocolTCP, Port: 443, NodePort: 34567}}}}
 
 	// getServiceOptions called with no service
 	options := mockCloud.getServiceOptions(nil)
 	assert.NotNil(t, options)
 	assert.Empty(t, options.annotations)
 	assert.Equal(t, options.enabledFeatures, "")
+	assert.Equal(t, options.healthCheckDelay, 0)
 	assert.Equal(t, options.healthCheckNodePort, 0)
+	assert.Equal(t, options.healthCheckPath, "")
+	assert.Equal(t, options.healthCheckPort, 0)
+	assert.Equal(t, options.healthCheckProtocol, "")
+	assert.Equal(t, options.healthCheckRetries, 0)
+	assert.Equal(t, options.healthCheckTimeout, 0)
+	assert.Equal(t, options.healthCheckUDP, 0)
+	assert.Equal(t, options.idleConnTimeout, 0)
+	assert.False(t, options.serviceUDP)
 	assert.Equal(t, options.getHealthCheckNodePort(), 0)
+	assert.Equal(t, options.getHealthCheckUDP(), 0)
+	assert.Equal(t, options.getServiceCRN(), "")
+	assert.Equal(t, options.getServiceName(), "")
 	assert.Equal(t, options.getServiceSubnets(), "")
+	assert.Equal(t, options.getServiceType(), "alb")
 	assert.Equal(t, options.getServiceZone(), "")
+	assert.True(t, options.isALB())
+	assert.False(t, options.isNLB())
 	assert.False(t, options.isProxyProtocol())
 	assert.True(t, options.isPublic())
+	assert.False(t, options.isSdnlb())
+	assert.False(t, options.isSdnlbInternal())
+	assert.False(t, options.isSdnlbPartner())
+	assert.False(t, options.isUDP())
+	assert.Equal(t, options.getSdnlbOption(), "")
 
-	// getServiceOptions called with a mock service (nlb, sDNLB, proxy-protocol, private ...)
-	options = mockCloud.getServiceOptions(mockService)
+	// getServiceOptions created by validating a mock service
+	mockCloud = &CloudVpc{Config: &ConfigVpc{WorkerAccountID: "workerAccountID"}}
+	options, err := mockCloud.validateService(mockService)
+	assert.Nil(t, err)
 	assert.NotNil(t, options)
-	assert.Equal(t, len(options.annotations), 4)
+	assert.Equal(t, len(options.annotations), 12)
 	assert.Equal(t, options.enabledFeatures, options.annotations[serviceAnnotationEnableFeatures])
 	assert.Equal(t, options.healthCheckNodePort, 36963)
+	assert.Equal(t, options.healthCheckUDP, 10250)
+	assert.True(t, options.serviceUDP)
+	assert.Equal(t, options.getHealthCheckDelay(), 10)
 	assert.Equal(t, options.getHealthCheckNodePort(), 36963)
+	assert.Equal(t, options.getHealthCheckPath(), "/health")
+	assert.Equal(t, options.getHealthCheckPort(), 443)
+	assert.Equal(t, options.getHealthCheckProtocol(), "https")
+	assert.Equal(t, options.getHealthCheckRetries(), 5)
+	assert.Equal(t, options.getHealthCheckTimeout(), 4)
+	assert.Equal(t, options.getHealthCheckUDP(), 10250)
+	assert.Equal(t, options.getIdleConnectionTimeout(), 50)
+	assert.Equal(t, options.getServiceCRN(), "serviceCRN")
+	assert.Equal(t, options.getServiceName(), "default/echo-server")
 	assert.Equal(t, options.getServiceSubnets(), "vpc-subnets")
+	assert.Equal(t, options.getServiceType(), "nlb")
 	assert.Equal(t, options.getServiceZone(), "us-south-1")
-	assert.True(t, options.isProxyProtocol())
+	assert.False(t, options.isALB())
+	assert.True(t, options.isNLB())
+	assert.False(t, options.isProxyProtocol())
 	assert.False(t, options.isPublic())
+	assert.False(t, options.isSdnlb())
+	assert.False(t, options.isSdnlbInternal())
+	assert.False(t, options.isSdnlbPartner())
+	assert.True(t, options.isUDP())
+
+	// Make sure partner sDNLB is returned correctly for the service
+	mockService.Annotations[serviceAnnotationEnableFeatures] = LoadBalancerOptionsSdnlbPartner
+	options = mockCloud.getServiceOptions(mockService)
+	assert.True(t, options.isSdnlb())
+	assert.False(t, options.isSdnlbInternal())
+	assert.True(t, options.isSdnlbPartner())
+	assert.Equal(t, options.getSdnlbOption(), LoadBalancerOptionsSdnlbPartner)
 }
 
 func TestIsVpcOptionEnabled(t *testing.T) {
@@ -191,6 +265,18 @@ func TestVpcLoadBalancer_getSubnetIDs(t *testing.T) {
 	assert.Equal(t, result[1], "subnet-2")
 }
 
+func TestVpcLoadBalancer_GetSuccessString(t *testing.T) {
+	lb := &VpcLoadBalancer{
+		Hostname:   "hostname",
+		PrivateIps: []string{"10.0.0.1", "10.0.0.2"},
+	}
+	result := lb.GetSuccessString()
+	assert.Equal(t, result, "hostname")
+	lb.Hostname = ""
+	result = lb.GetSuccessString()
+	assert.Equal(t, result, "10.0.0.1,10.0.0.2")
+}
+
 func TestVpcLoadBalancer_GetSummary(t *testing.T) {
 	lb := &VpcLoadBalancer{
 		Name:               "LoadBalancer",
@@ -237,6 +323,18 @@ func TestVpcLoadBalancer_getZones(t *testing.T) {
 	assert.Equal(t, result[1], "us-south-2")
 }
 
+func TestVpcLoadBalancer_IsNLB(t *testing.T) {
+	// Normal LB
+	lb := &VpcLoadBalancer{}
+	rc := lb.IsNLB()
+	assert.False(t, rc)
+
+	// NLB
+	lb = &VpcLoadBalancer{ProfileFamily: "network"}
+	rc = lb.IsNLB()
+	assert.True(t, rc)
+}
+
 func TestVpcLoadBalancer_IsReady(t *testing.T) {
 	// Status is "online/active"
 	lb := &VpcLoadBalancer{
@@ -253,4 +351,67 @@ func TestVpcLoadBalancer_IsReady(t *testing.T) {
 	}
 	ready = lb.IsReady()
 	assert.Equal(t, ready, false)
+}
+
+func TestVpcSecurityGroupRule_allowsTraffic(t *testing.T) {
+	rule := VpcSecurityGroupRule{
+		Direction: SecurityGroupRuleDirectionInbound,
+		Protocol:  SecurityGroupRuleProtocolTCP,
+		PortMin:   30000,
+		PortMax:   32767,
+	}
+	result := rule.allowsTraffic("inbound", "tcp", 30303, 30303)
+	assert.True(t, result)
+	result = rule.allowsTraffic("outbound", "tcp", 30303, 30303)
+	assert.False(t, result)
+	result = rule.allowsTraffic("inbound", "udp", 30303, 30303)
+	assert.False(t, result)
+	result = rule.allowsTraffic("inbound", "tcp", 30303, 33333)
+	assert.False(t, result)
+}
+
+func TestVpcSecurityGroupRule_display(t *testing.T) {
+	rule := VpcSecurityGroupRule{
+		ID:        "ruleID",
+		Direction: SecurityGroupRuleDirectionInbound,
+		Protocol:  SecurityGroupRuleProtocolTCP,
+		PortMin:   30000,
+		PortMax:   32767,
+	}
+	result := rule.display()
+	assert.Equal(t, result, "{ ID:ruleID Direction:inbound Protocol:tcp Ports:30000-32767 }")
+}
+
+func TestVpcSecurityGroupRule_insidePortRange(t *testing.T) {
+	rule := VpcSecurityGroupRule{
+		Direction: SecurityGroupRuleDirectionInbound,
+		Protocol:  SecurityGroupRuleProtocolTCP,
+		PortMin:   30303,
+		PortMax:   30303,
+	}
+	result := rule.insidePortRange("inbound", "tcp", 30000, 32767)
+	assert.True(t, result)
+	result = rule.insidePortRange("outbound", "tcp", 30000, 32767)
+	assert.False(t, result)
+	result = rule.insidePortRange("inbound", "udp", 30000, 32767)
+	assert.False(t, result)
+	result = rule.insidePortRange("inbound", "tcp", 32000, 32767)
+	assert.False(t, result)
+}
+
+func TestVpcSecurityGroupRule_matchesPorts(t *testing.T) {
+	rule := VpcSecurityGroupRule{
+		Direction: SecurityGroupRuleDirectionInbound,
+		Protocol:  SecurityGroupRuleProtocolTCP,
+		PortMin:   30303,
+		PortMax:   30303,
+	}
+	result := rule.matchesPorts("inbound", "tcp", 30303, 30303)
+	assert.True(t, result)
+	result = rule.matchesPorts("outbound", "tcp", 30303, 30303)
+	assert.False(t, result)
+	result = rule.matchesPorts("inbound", "udp", 30303, 30303)
+	assert.False(t, result)
+	result = rule.matchesPorts("inbound", "tcp", 30300, 30303)
+	assert.False(t, result)
 }

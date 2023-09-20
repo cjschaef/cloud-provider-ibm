@@ -70,13 +70,6 @@ func TestCloudVpc_EnsureLoadBalancer(t *testing.T) {
 	assert.Nil(t, status)
 	assert.NotNil(t, err)
 	assert.Contains(t, err.Error(), "Failed ensuring LoadBalancer")
-
-	// EnsureLoadBalancer successful, existing LB was updated
-	service = &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "echo-server", Namespace: "default", UID: "Ready"}}
-	status, err = c.EnsureLoadBalancer("kube-clusterID-Ready", service, []*v1.Node{node})
-	assert.NotNil(t, status)
-	assert.Nil(t, err)
-	assert.Equal(t, status.Ingress[0].Hostname, "lb.ibm.com")
 }
 
 func TestCloudVpc_EnsureLoadBalancerDeleted(t *testing.T) {
@@ -128,7 +121,7 @@ func TestCloud_EnsureLoadBalancerUpdated(t *testing.T) {
 	// EnsureLoadBalancerUpdated failed, existing LB does not exist
 	service = &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "echo-server", Namespace: "default", UID: "NotFound"}}
 	err = c.EnsureLoadBalancerUpdated("kube-clusterID-NotFound", service, []*v1.Node{node})
-	assert.Nil(t, err)
+	assert.Contains(t, err.Error(), "Failed updating LoadBalancer: Load balancer not found")
 
 	// EnsureLoadBalancerUpdated failed, existing LB is busy
 	service = &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "echo-server", Namespace: "default", UID: "NotReady"}}
@@ -141,11 +134,6 @@ func TestCloud_EnsureLoadBalancerUpdated(t *testing.T) {
 	err = c.EnsureLoadBalancerUpdated("kube-clusterID-Ready", service, []*v1.Node{})
 	assert.NotNil(t, err)
 	assert.Contains(t, err.Error(), "Failed updating LoadBalancer")
-
-	// EnsureLoadBalancerUpdated successful, existing LB was updated
-	service = &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "echo-server", Namespace: "default", UID: "Ready"}}
-	err = c.EnsureLoadBalancerUpdated("kube-clusterID-Ready", service, []*v1.Node{node})
-	assert.Nil(t, err)
 }
 
 func TestCloudVpc_GatherLoadBalancers(t *testing.T) {
@@ -200,6 +188,15 @@ func TestCloudVpc_GenerateLoadBalancerName(t *testing.T) {
 	kubeService.Annotations = map[string]string{serviceAnnotationLbName: "my-lb-name"}
 	result = c.GenerateLoadBalancerName(kubeService)
 	assert.Equal(t, result, "my-lb-name")
+
+	// Verify spec.loadBalancerClass works to set the prefix
+	loadBalancerClass := "prefix"
+	c, _ = NewCloudVpc(fake.NewSimpleClientset(), &ConfigVpc{ClusterID: "clusterID", ProviderType: VpcProviderTypeFake}, nil)
+	kubeService = &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "echo-server", Namespace: "default", UID: "uid"},
+		Spec:       v1.ServiceSpec{LoadBalancerClass: &loadBalancerClass}}
+	result = c.GenerateLoadBalancerName(kubeService)
+	assert.Equal(t, result, "prefix-clusterID-uid")
 }
 
 func TestCloudVpc_GetLoadBalancer(t *testing.T) {

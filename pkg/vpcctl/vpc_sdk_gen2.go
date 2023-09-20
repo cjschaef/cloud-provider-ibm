@@ -1,6 +1,6 @@
 /*******************************************************************************
 * IBM Cloud Kubernetes Service, 5737-D43
-* (C) Copyright IBM Corp. 2021, 2022 All Rights Reserved.
+* (C) Copyright IBM Corp. 2021, 2023 All Rights Reserved.
 *
 * SPDX-License-Identifier: Apache2.0
 *
@@ -22,8 +22,8 @@ package vpcctl
 import (
 	"fmt"
 	"net/url"
+	"regexp"
 	"sort"
-	"strings"
 	"time"
 
 	"cloud.ibm.com/cloud-provider-ibm/pkg/klog"
@@ -40,7 +40,10 @@ type VpcSdkGen2 struct {
 
 // NewVpcSdkGen2 - create new SDK client
 func NewVpcSdkGen2(c *ConfigVpc) (CloudVpcSdk, error) {
-	authenticator := &core.IamAuthenticator{ApiKey: c.APIKeySecret, URL: c.tokenExchangeURL}
+	authenticator, err := c.GetAuthenticator()
+	if err != nil {
+		return nil, err
+	}
 	client, err := sdk.NewVpcV1(&sdk.VpcV1Options{
 		Authenticator: authenticator,
 		URL:           c.endpointURL})
@@ -49,7 +52,7 @@ func NewVpcSdkGen2(c *ConfigVpc) (CloudVpcSdk, error) {
 	}
 	// Convert the resource group name to an ID
 	if c.resourceGroupID == "" && c.ResourceGroupName != "" {
-		err = convertResourceGroupNameToID(c)
+		err = convertResourceGroupNameToID(c, authenticator)
 		if err != nil {
 			return nil, err
 		}
@@ -65,15 +68,9 @@ func NewVpcSdkGen2(c *ConfigVpc) (CloudVpcSdk, error) {
 }
 
 // convertResourceGroupNameToID - convert the resource group name into an ID
-func convertResourceGroupNameToID(c *ConfigVpc) error {
-	// Determine if URL for the resource manager
-	url := resourcemanagerv2.DefaultServiceURL
-	if strings.Contains(c.endpointURL, "iaasdev.cloud.ibm.com") {
-		url = "https://resource-controller.test.cloud.ibm.com"
-	}
+func convertResourceGroupNameToID(c *ConfigVpc, authenticator core.Authenticator) error {
 	// Create resource manager client
-	authenticator := &core.IamAuthenticator{ApiKey: c.APIKeySecret, URL: c.tokenExchangeURL}
-	client, err := resourcemanagerv2.NewResourceManagerV2(&resourcemanagerv2.ResourceManagerV2Options{URL: url, Authenticator: authenticator})
+	client, err := resourcemanagerv2.NewResourceManagerV2(&resourcemanagerv2.ResourceManagerV2Options{URL: c.resourceManagerURL, Authenticator: authenticator})
 	if err != nil {
 		return fmt.Errorf("Failed to create resource manager v2 client: %v", err)
 	}
@@ -99,6 +96,7 @@ func convertResourceGroupNameToID(c *ConfigVpc) error {
 // CreateLoadBalancer - create a load balancer
 func (v *VpcSdkGen2) CreateLoadBalancer(lbName string, nodeList, poolList, subnetList []string, options *ServiceOptions) (*VpcLoadBalancer, error) {
 	// For each of the ports in the Kubernetes service
+	isNLB := options.isNLB()
 	listeners := []sdk.LoadBalancerListenerPrototypeLoadBalancerContext{}
 	pools := []sdk.LoadBalancerPoolPrototype{}
 	for _, poolName := range poolList {
@@ -108,22 +106,44 @@ func (v *VpcSdkGen2) CreateLoadBalancer(lbName string, nodeList, poolList, subne
 		}
 		pool := sdk.LoadBalancerPoolPrototype{
 			Algorithm:     core.StringPtr(sdk.LoadBalancerPoolPrototypeAlgorithmRoundRobinConst),
-			HealthMonitor: v.genLoadBalancerHealthMonitor(poolNameFields.NodePort, options.getHealthCheckNodePort()),
-			Members:       v.genLoadBalancerMembers(poolNameFields.NodePort, nodeList),
+			HealthMonitor: v.genLoadBalancerHealthMonitor(poolNameFields, options),
+			Members:       v.genLoadBalancerMembers(poolNameFields.NodePort, nodeList, options),
 			Name:          core.StringPtr(poolName),
 			Protocol:      core.StringPtr(poolNameFields.Protocol),
 			ProxyProtocol: core.StringPtr(sdk.LoadBalancerPoolProxyProtocolDisabledConst),
+		}
+		// NLB does not support setting the proxy protocol field
+		if isNLB {
+			pool.ProxyProtocol = nil
 		}
 		// Set proxy protocol if it was requested on the service annotation (we don't support v2)
 		if options.isProxyProtocol() {
 			pool.ProxyProtocol = core.StringPtr(sdk.LoadBalancerPoolProxyProtocolV1Const)
 		}
+		// LoadBalancerOptionLeastConnections / LoadBalancerOptionSessionAffinity are currently not supported
+		// See issue: https://github.ibm.com/alchemy-containers/armada-network/issues/3470
+		//
+		// if isVpcOptionEnabled(options, LoadBalancerOptionLeastConnections) {
+		// 	pool.Algorithm = core.StringPtr(sdk.LoadBalancerPoolPrototypeAlgorithmLeastConnectionsConst)
+		// }
+		// if isVpcOptionEnabled(options, LoadBalancerOptionSessionAffinity) {
+		// 	pool.SessionPersistence = &sdk.LoadBalancerPoolSessionPersistencePrototype{Type: core.StringPtr(sdk.LoadBalancerPoolSessionPersistencePrototypeTypeSourceIPConst)}
+		// }
 		pools = append(pools, pool)
 		listener := sdk.LoadBalancerListenerPrototypeLoadBalancerContext{
-			ConnectionLimit: core.Int64Ptr(15000),
-			DefaultPool:     &sdk.LoadBalancerPoolIdentityByName{Name: core.StringPtr(poolName)},
-			Port:            core.Int64Ptr(int64(poolNameFields.Port)),
-			Protocol:        core.StringPtr(sdk.LoadBalancerListenerPrototypeLoadBalancerContextProtocolTCPConst),
+			DefaultPool: &sdk.LoadBalancerPoolIdentityByName{Name: core.StringPtr(poolName)},
+			Port:        core.Int64Ptr(int64(poolNameFields.PortMin)),
+			Protocol:    core.StringPtr(poolNameFields.Protocol),
+		}
+		// Connection limit and idle connection timeout only supported by ALBs
+		if options.isALB() {
+			listener.ConnectionLimit = core.Int64Ptr(15000)
+			listener.IdleConnectionTimeout = core.Int64Ptr(int64(options.getIdleConnectionTimeout()))
+		} else if poolNameFields.PortMin != poolNameFields.PortMax {
+			// Port ranges are only supported by NLBs
+			listener.Port = nil
+			listener.PortMin = core.Int64Ptr(int64(poolNameFields.PortMin))
+			listener.PortMax = core.Int64Ptr(int64(poolNameFields.PortMax))
 		}
 		listeners = append(listeners, listener)
 	}
@@ -143,10 +163,21 @@ func (v *VpcSdkGen2) CreateLoadBalancer(lbName string, nodeList, poolList, subne
 		Pools:         pools,
 		ResourceGroup: &sdk.ResourceGroupIdentity{ID: core.StringPtr(v.Config.resourceGroupID)},
 	}
+	if isNLB {
+		createOptions.Profile = &sdk.LoadBalancerProfileIdentityByName{Name: core.StringPtr("network-fixed")}
+		createOptions.Headers = map[string]string{"x-instance-account-id": v.Config.WorkerAccountID}
+	} else if v.Config.lbSecurityGroupID != "" {
+		secGrp := &sdk.SecurityGroupIdentityByID{ID: core.StringPtr(v.Config.lbSecurityGroupID)}
+		createOptions.SecurityGroups = []sdk.SecurityGroupIdentityIntf{secGrp}
+	}
 
 	// Create the VPC LB
 	lb, response, err := v.Client.CreateLoadBalancer(createOptions)
 	if err != nil {
+		// If an error occurred creating the LB with a secGroupID, maybe the secGroupID is no longer valid. Reset it
+		if len(createOptions.SecurityGroups) > 1 {
+			v.Config.lbSecurityGroupID = ""
+		}
 		v.logResponseError(response)
 		return nil, err
 	}
@@ -156,7 +187,7 @@ func (v *VpcSdkGen2) CreateLoadBalancer(lbName string, nodeList, poolList, subne
 }
 
 // CreateLoadBalancerListener - create a load balancer listener
-func (v *VpcSdkGen2) CreateLoadBalancerListener(lbID, poolName, poolID string) (*VpcLoadBalancerListener, error) {
+func (v *VpcSdkGen2) CreateLoadBalancerListener(lbID, poolName, poolID string, options *ServiceOptions) (*VpcLoadBalancerListener, error) {
 	// Extract values from poolName
 	poolNameFields, err := extractFieldsFromPoolName(poolName)
 	if err != nil {
@@ -164,11 +195,20 @@ func (v *VpcSdkGen2) CreateLoadBalancerListener(lbID, poolName, poolID string) (
 	}
 	// Initialize the create options
 	createOptions := &sdk.CreateLoadBalancerListenerOptions{
-		LoadBalancerID:  core.StringPtr(lbID),
-		ConnectionLimit: core.Int64Ptr(15000),
-		Port:            core.Int64Ptr(int64(poolNameFields.Port)),
-		Protocol:        core.StringPtr(poolNameFields.Protocol),
-		DefaultPool:     &sdk.LoadBalancerPoolIdentity{ID: core.StringPtr(poolID)},
+		LoadBalancerID: core.StringPtr(lbID),
+		Port:           core.Int64Ptr(int64(poolNameFields.PortMin)),
+		Protocol:       core.StringPtr(poolNameFields.Protocol),
+		DefaultPool:    &sdk.LoadBalancerPoolIdentity{ID: core.StringPtr(poolID)},
+	}
+	// Connection limit and idle connection timeout only supported by ALBs
+	if options.isALB() {
+		createOptions.ConnectionLimit = core.Int64Ptr(15000)
+		createOptions.IdleConnectionTimeout = core.Int64Ptr(int64(options.getIdleConnectionTimeout()))
+	} else if poolNameFields.PortMin != poolNameFields.PortMax {
+		// Port ranges are only supported by NLBs
+		createOptions.Port = nil
+		createOptions.PortMin = core.Int64Ptr(int64(poolNameFields.PortMin))
+		createOptions.PortMax = core.Int64Ptr(int64(poolNameFields.PortMax))
 	}
 	// Create the VPC LB listener
 	listener, response, err := v.Client.CreateLoadBalancerListener(createOptions)
@@ -191,11 +231,24 @@ func (v *VpcSdkGen2) CreateLoadBalancerPool(lbID, poolName string, nodeList []st
 	createOptions := &sdk.CreateLoadBalancerPoolOptions{
 		LoadBalancerID: core.StringPtr(lbID),
 		Algorithm:      core.StringPtr(sdk.CreateLoadBalancerPoolOptionsAlgorithmRoundRobinConst),
-		HealthMonitor:  v.genLoadBalancerHealthMonitor(poolNameFields.NodePort, options.getHealthCheckNodePort()),
-		Members:        v.genLoadBalancerMembers(poolNameFields.NodePort, nodeList),
+		HealthMonitor:  v.genLoadBalancerHealthMonitor(poolNameFields, options),
+		Members:        v.genLoadBalancerMembers(poolNameFields.NodePort, nodeList, options),
 		Name:           core.StringPtr(poolName),
 		Protocol:       core.StringPtr(poolNameFields.Protocol),
 	}
+	// LoadBalancerOptionLeastConnections / LoadBalancerOptionSessionAffinity are currently not supported
+	// See issue: https://github.ibm.com/alchemy-containers/armada-network/issues/3470
+	//
+	// if isVpcOptionEnabled(options, LoadBalancerOptionLeastConnections) {
+	// 	createOptions.Algorithm = core.StringPtr(sdk.CreateLoadBalancerPoolOptionsAlgorithmLeastConnectionsConst)
+	// }
+	// if isVpcOptionEnabled(options, LoadBalancerOptionSessionAffinity) {
+	// 	createOptions.SessionPersistence = &sdk.LoadBalancerPoolSessionPersistencePrototype{Type: core.StringPtr(sdk.LoadBalancerPoolSessionPersistencePrototypeTypeSourceIPConst)}
+	// }
+	if options.isNLB() {
+		createOptions.Headers = map[string]string{"x-instance-account-id": v.Config.WorkerAccountID}
+	}
+	// Create the VPC LB pool
 	pool, response, err := v.Client.CreateLoadBalancerPool(createOptions)
 	if err != nil {
 		v.logResponseError(response)
@@ -206,7 +259,7 @@ func (v *VpcSdkGen2) CreateLoadBalancerPool(lbID, poolName string, nodeList []st
 }
 
 // CreateLoadBalancerPoolMember - create a load balancer pool member
-func (v *VpcSdkGen2) CreateLoadBalancerPoolMember(lbID, poolName, poolID, nodeID string) (*VpcLoadBalancerPoolMember, error) {
+func (v *VpcSdkGen2) CreateLoadBalancerPoolMember(lbID, poolName, poolID, nodeID string, options *ServiceOptions) (*VpcLoadBalancerPoolMember, error) {
 	// Extract values from poolName
 	poolNameFields, err := extractFieldsFromPoolName(poolName)
 	if err != nil {
@@ -217,7 +270,12 @@ func (v *VpcSdkGen2) CreateLoadBalancerPoolMember(lbID, poolName, poolID, nodeID
 		LoadBalancerID: core.StringPtr(lbID),
 		PoolID:         core.StringPtr(poolID),
 		Port:           core.Int64Ptr(int64(poolNameFields.NodePort)),
-		Target:         &sdk.LoadBalancerPoolMemberTargetPrototypeIP{Address: core.StringPtr(nodeID)},
+	}
+	if options.isNLB() {
+		createOptions.Target = &sdk.LoadBalancerPoolMemberTargetPrototypeInstanceIdentityInstanceIdentityByID{ID: core.StringPtr(nodeID)}
+		createOptions.Headers = map[string]string{"x-instance-account-id": v.Config.WorkerAccountID}
+	} else {
+		createOptions.Target = &sdk.LoadBalancerPoolMemberTargetPrototypeIP{Address: core.StringPtr(nodeID)}
 	}
 	// Create the VPC LB pool member
 	member, response, err := v.Client.CreateLoadBalancerPoolMember(createOptions)
@@ -229,8 +287,41 @@ func (v *VpcSdkGen2) CreateLoadBalancerPoolMember(lbID, poolName, poolID, nodeID
 	return v.mapLoadBalancerPoolMember(*member), nil
 }
 
+// CreateSecurityGroupRule - create an inbound, TCP security group rule for the specified port
+func (v *VpcSdkGen2) CreateSecurityGroupRule(secGroupID, direction, protocol string, portMin, portMax int, remoteSG string) (*VpcSecurityGroupRule, error) {
+	// Set up the rule options
+	ruleOptions := &sdk.SecurityGroupRulePrototypeSecurityGroupRuleProtocolTcpudp{
+		Direction: core.StringPtr(direction),
+		IPVersion: core.StringPtr(sdk.SecurityGroupRulePrototypeSecurityGroupRuleProtocolTcpudpIPVersionIpv4Const),
+		PortMin:   core.Int64Ptr(int64(portMin)),
+		PortMax:   core.Int64Ptr(int64(portMax)),
+		Protocol:  core.StringPtr(protocol),
+	}
+	// TODO: Can't set remote rule due to quota limitation.
+	//
+	// Exceeded limit of remote rules per security group (the limit is 5 remote rules per security group)
+	// Adding a rule would exceed the limit of remote rules per security group. Consider creating another security group.
+	//
+	// if remoteSG != "" {
+	// 	ruleOptions.Remote = &sdk.SecurityGroupRuleRemotePrototype{ID: core.StringPtr(remoteSG)}
+	// }
+	// Initialize the create options
+	createOptions := &sdk.CreateSecurityGroupRuleOptions{
+		SecurityGroupID:            core.StringPtr(secGroupID),
+		SecurityGroupRulePrototype: ruleOptions,
+	}
+	// Create the VPC LB listener
+	rule, response, err := v.Client.CreateSecurityGroupRule(createOptions)
+	if err != nil {
+		v.logResponseError(response)
+		return nil, err
+	}
+	// Map the generated object back to the common format
+	return v.mapSecurityGroupRule(rule), nil
+}
+
 // DeleteLoadBalancer - delete the specified VPC load balancer
-func (v *VpcSdkGen2) DeleteLoadBalancer(lbID string) error {
+func (v *VpcSdkGen2) DeleteLoadBalancer(lbID string, options *ServiceOptions) error {
 	response, err := v.Client.DeleteLoadBalancer(&sdk.DeleteLoadBalancerOptions{ID: &lbID})
 	if err != nil {
 		v.logResponseError(response)
@@ -265,23 +356,73 @@ func (v *VpcSdkGen2) DeleteLoadBalancerPoolMember(lbID, poolID, memberID string)
 	return err
 }
 
+// DeleteSecurityGroupRule - delete the specified VPC security group rule
+func (v *VpcSdkGen2) DeleteSecurityGroupRule(secGroupID, rulelID string) error {
+	response, err := v.Client.DeleteSecurityGroupRule(&sdk.DeleteSecurityGroupRuleOptions{SecurityGroupID: &secGroupID, ID: &rulelID})
+	if err != nil {
+		v.logResponseError(response)
+	}
+	return err
+}
+
+// DeleteServiceRegistration - delete the service registration for the specified service CRN
+func (v *VpcSdkGen2) DeleteServiceRegistration(serviceCRN string) error {
+	return fmt.Errorf("Not supported")
+}
+
+// FindLoadBalancer - locate a VPC load balancer based on the Name, ID, or hostname
+func (v *VpcSdkGen2) FindLoadBalancer(nameID string, options *ServiceOptions) (*VpcLoadBalancer, error) {
+	// If nameID looks like an "ID", r134-d985bb3a-371d-4aa2-8462-626461a955e1, then attempt to extract that single LB
+	match, err := regexp.MatchString("[a-z0-9]{4}-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", nameID)
+	if match && err == nil {
+		lb, err := v.GetLoadBalancer(nameID)
+		if err == nil {
+			return lb, nil
+		}
+	}
+	lbs, err := v.ListLoadBalancers()
+	if err != nil {
+		return nil, err
+	}
+	for _, lb := range lbs {
+		if nameID == lb.ID || nameID == lb.Name || nameID == lb.Hostname {
+			return lb, nil
+		}
+	}
+	return nil, nil
+}
+
 // genLoadBalancerHealthMonitor - generate the VPC health monitor template for load balancer
-func (v *VpcSdkGen2) genLoadBalancerHealthMonitor(nodePort, healthCheckPort int) *sdk.LoadBalancerPoolHealthMonitorPrototype {
+func (v *VpcSdkGen2) genLoadBalancerHealthMonitor(poolNameFields *VpcPoolNameFields, options *ServiceOptions) *sdk.LoadBalancerPoolHealthMonitorPrototype {
 	// Define health monitor for load balancer.
 	//
 	// The Delay, MaxRetries, and Timeout values listed below are the default values that are selected when
 	// a load balancer is created in the VPC UI.  These values may need to be adjusted for IKS clusters.
 	healthMonitor := &sdk.LoadBalancerPoolHealthMonitorPrototype{
-		Delay:      core.Int64Ptr(5),
-		MaxRetries: core.Int64Ptr(2),
-		Port:       core.Int64Ptr(int64(nodePort)),
-		Timeout:    core.Int64Ptr(2),
+		Delay:      core.Int64Ptr(int64(options.getHealthCheckDelay())),
+		MaxRetries: core.Int64Ptr(int64(options.getHealthCheckRetries())),
+		Port:       core.Int64Ptr(int64(poolNameFields.NodePort)),
+		Timeout:    core.Int64Ptr(int64(options.getHealthCheckTimeout())),
 		Type:       core.StringPtr(sdk.LoadBalancerPoolHealthMonitorPrototypeTypeTCPConst),
 	}
-
-	// If the service has: "externalTrafficPolicy: local", then set the health check to be HTTP
-	if healthCheckPort > 0 {
-		healthMonitor.Port = core.Int64Ptr(int64(healthCheckPort))
+	// If UDP protocol, then change the port to the UDP health check port
+	if poolNameFields.Protocol == "udp" {
+		healthMonitor.Port = core.Int64Ptr(int64(options.getHealthCheckUDP()))
+	}
+	// If custom health check annotations were specified, update the type, port, and path
+	if options.getHealthCheckProtocol() != "" {
+		healthMonitor.Type = core.StringPtr(options.getHealthCheckProtocol())
+		if options.getHealthCheckPort() != 0 {
+			healthMonitor.Port = core.Int64Ptr(int64(options.getHealthCheckPort()))
+		} else {
+			healthMonitor.Port = core.Int64Ptr(int64(poolNameFields.NodePort))
+		}
+		if options.getHealthCheckProtocol() != "tcp" {
+			healthMonitor.URLPath = core.StringPtr(options.getHealthCheckPath())
+		}
+	} else if options.getHealthCheckNodePort() > 0 {
+		// If the service has: "externalTrafficPolicy: local", then set the health check to be HTTP
+		healthMonitor.Port = core.Int64Ptr(int64(options.getHealthCheckNodePort()))
 		healthMonitor.Type = core.StringPtr(sdk.LoadBalancerPoolHealthMonitorPrototypeTypeHTTPConst)
 		healthMonitor.URLPath = core.StringPtr("/")
 	}
@@ -289,22 +430,36 @@ func (v *VpcSdkGen2) genLoadBalancerHealthMonitor(nodePort, healthCheckPort int)
 }
 
 // genLoadBalancerHealthMonitorUpdate - generate the VPC health monitor update template for load balancer pool
-func (v *VpcSdkGen2) genLoadBalancerHealthMonitorUpdate(nodePort, healthCheckPort int) *sdk.LoadBalancerPoolHealthMonitorPatch {
+func (v *VpcSdkGen2) genLoadBalancerHealthMonitorUpdate(poolNameFields *VpcPoolNameFields, options *ServiceOptions) *sdk.LoadBalancerPoolHealthMonitorPatch {
 	// Define health monitor for load balancer.
 	//
 	// The Delay, MaxRetries, and Timeout values listed below are the default values that are selected when
 	// a load balancer is created in the VPC UI.  These values may need to be adjusted for IKS clusters.
 	healthMonitor := &sdk.LoadBalancerPoolHealthMonitorPatch{
-		Delay:      core.Int64Ptr(5),
-		MaxRetries: core.Int64Ptr(2),
-		Port:       core.Int64Ptr(int64(nodePort)),
-		Timeout:    core.Int64Ptr(2),
+		Delay:      core.Int64Ptr(int64(options.getHealthCheckDelay())),
+		MaxRetries: core.Int64Ptr(int64(options.getHealthCheckRetries())),
+		Port:       core.Int64Ptr(int64(poolNameFields.NodePort)),
+		Timeout:    core.Int64Ptr(int64(options.getHealthCheckTimeout())),
 		Type:       core.StringPtr(sdk.LoadBalancerPoolHealthMonitorPrototypeTypeTCPConst),
 	}
-
-	// If the service has: "externalTrafficPolicy: local", then set the health check to be HTTP
-	if healthCheckPort > 0 {
-		healthMonitor.Port = core.Int64Ptr(int64(healthCheckPort))
+	// If UDP protocol, then change the port to the UDP health check port
+	if poolNameFields.Protocol == "udp" {
+		healthMonitor.Port = core.Int64Ptr(int64(options.getHealthCheckUDP()))
+	}
+	// If custom health check annotations were specified, update the type, port, and path
+	if options.getHealthCheckProtocol() != "" {
+		healthMonitor.Type = core.StringPtr(options.getHealthCheckProtocol())
+		if options.getHealthCheckPort() != 0 {
+			healthMonitor.Port = core.Int64Ptr(int64(options.getHealthCheckPort()))
+		} else {
+			healthMonitor.Port = core.Int64Ptr(int64(poolNameFields.NodePort))
+		}
+		if options.getHealthCheckProtocol() != "tcp" {
+			healthMonitor.URLPath = core.StringPtr(options.getHealthCheckPath())
+		}
+	} else if options.getHealthCheckNodePort() > 0 {
+		// If the service has: "externalTrafficPolicy: local", then set the health check to be HTTP
+		healthMonitor.Port = core.Int64Ptr(int64(options.getHealthCheckNodePort()))
 		healthMonitor.Type = core.StringPtr(sdk.LoadBalancerPoolHealthMonitorPrototypeTypeHTTPConst)
 		healthMonitor.URLPath = core.StringPtr("/")
 	}
@@ -312,12 +467,17 @@ func (v *VpcSdkGen2) genLoadBalancerHealthMonitorUpdate(nodePort, healthCheckPor
 }
 
 // genLoadBalancerMembers - generate the VPC member template for load balancer
-func (v *VpcSdkGen2) genLoadBalancerMembers(nodePort int, nodeList []string) []sdk.LoadBalancerPoolMemberPrototype {
+func (v *VpcSdkGen2) genLoadBalancerMembers(nodePort int, nodeList []string, options *ServiceOptions) []sdk.LoadBalancerPoolMemberPrototype {
 	// Create list of backend nodePorts on each of the nodes
 	members := []sdk.LoadBalancerPoolMemberPrototype{}
+	nodeInstanceIDs := options.isNLB()
 	for _, node := range nodeList {
 		member := sdk.LoadBalancerPoolMemberPrototype{Port: core.Int64Ptr(int64(nodePort))}
-		member.Target = &sdk.LoadBalancerPoolMemberTargetPrototypeIP{Address: core.StringPtr(node)}
+		if nodeInstanceIDs {
+			member.Target = &sdk.LoadBalancerPoolMemberTargetPrototypeInstanceIdentityInstanceIdentityByID{ID: core.StringPtr(node)}
+		} else {
+			member.Target = &sdk.LoadBalancerPoolMemberTargetPrototypeIP{Address: core.StringPtr(node)}
+		}
 		members = append(members, member)
 	}
 	return members
@@ -333,6 +493,16 @@ func (v *VpcSdkGen2) GetLoadBalancer(lbID string) (*VpcLoadBalancer, error) {
 	return v.mapLoadBalancer(*lb), nil
 }
 
+// GetSecurityGroup - return a specific security group
+func (v *VpcSdkGen2) GetSecurityGroup(secGroupID string) (*VpcSecurityGroup, error) {
+	secGroup, response, err := v.Client.GetSecurityGroup(&sdk.GetSecurityGroupOptions{ID: &secGroupID})
+	if err != nil {
+		v.logResponseError(response)
+		return nil, err
+	}
+	return v.mapSecurityGroup(*secGroup), nil
+}
+
 // GetSubnet - get a specific subnet
 func (v *VpcSdkGen2) GetSubnet(subnetID string) (*VpcSubnet, error) {
 	subnet, response, err := v.Client.GetSubnet(&sdk.GetSubnetOptions{ID: &subnetID})
@@ -341,6 +511,16 @@ func (v *VpcSdkGen2) GetSubnet(subnetID string) (*VpcSubnet, error) {
 		return nil, err
 	}
 	return v.mapSubnet(*subnet), nil
+}
+
+// GetVPC - return a specific VPC
+func (v *VpcSdkGen2) GetVPC(vpcID string) (*Vpc, error) {
+	vpc, response, err := v.Client.GetVPC(&sdk.GetVPCOptions{ID: &vpcID})
+	if err != nil {
+		v.logResponseError(response)
+		return nil, err
+	}
+	return v.mapVpc(*vpc), nil
 }
 
 // ListLoadBalancers - return list of load balancers
@@ -356,7 +536,7 @@ func (v *VpcSdkGen2) ListLoadBalancers() ([]*VpcLoadBalancer, error) {
 		for _, item := range list.LoadBalancers {
 			lbs = append(lbs, v.mapLoadBalancer(item))
 		}
-		// Check to see if more subnets need to be retrieved
+		// Check to see if more need to be retrieved
 		if list.Next == nil || list.Next.Href == nil {
 			break
 		}
@@ -419,6 +599,71 @@ func (v *VpcSdkGen2) ListLoadBalancerPoolMembers(lbID, poolID string) ([]*VpcLoa
 	return members, nil
 }
 
+func (v *VpcSdkGen2) ListNetworkACLs() ([]*VpcNetworkACL, error) {
+	acls := []*VpcNetworkACL{}
+	var start *string
+	for {
+		list, response, err := v.Client.ListNetworkAcls(&sdk.ListNetworkAclsOptions{Start: start})
+		if err != nil {
+			v.logResponseError(response)
+			return acls, err
+		}
+		for _, item := range list.NetworkAcls {
+			acls = append(acls, v.mapNetworkACL(item))
+		}
+		// Check to see if more need to be retrieved
+		if list.Next == nil || list.Next.Href == nil {
+			break
+		}
+		// We need to pull out the "start" query value and re-issue the call to RIaaS to get the next block of objects
+		u, err := url.Parse(*list.Next.Href)
+		if err != nil {
+			return acls, err
+		}
+		qryArgs := u.Query()
+		start = core.StringPtr(qryArgs.Get("start"))
+	}
+	return acls, nil
+}
+
+// ListSecurityGroups - return list of security groups
+func (v *VpcSdkGen2) ListSecurityGroups(vpcID string) ([]*VpcSecurityGroup, error) {
+	secGroups := []*VpcSecurityGroup{}
+	var start *string
+	var filterVpcID *string
+	if vpcID != "" {
+		filterVpcID = core.StringPtr(vpcID)
+	}
+	for {
+		list, response, err := v.Client.ListSecurityGroups(&sdk.ListSecurityGroupsOptions{Start: start, VPCID: filterVpcID})
+		if err != nil {
+			v.logResponseError(response)
+			return secGroups, err
+		}
+		for _, item := range list.SecurityGroups {
+			secGroups = append(secGroups, v.mapSecurityGroup(item))
+		}
+		// Check to see if more need to be retrieved
+		if list.Next == nil || list.Next.Href == nil {
+			break
+		}
+		// We need to pull out the "start" query value and re-issue the call to RIaaS to get the next block of objects
+		u, err := url.Parse(*list.Next.Href)
+		if err != nil {
+			return secGroups, err
+		}
+		qryArgs := u.Query()
+		start = core.StringPtr(qryArgs.Get("start"))
+	}
+	return secGroups, nil
+}
+
+// ListServiceRegistrations - return list of service registrations
+func (v *VpcSdkGen2) ListServiceRegistrations() ([]*VpcServiceRegistration, error) {
+	serviceRegisration := []*VpcServiceRegistration{}
+	return serviceRegisration, fmt.Errorf("Not supported")
+}
+
 // ListSubnets - return list of subnets
 func (v *VpcSdkGen2) ListSubnets() ([]*VpcSubnet, error) {
 	subnets := []*VpcSubnet{}
@@ -428,6 +673,7 @@ func (v *VpcSdkGen2) ListSubnets() ([]*VpcSubnet, error) {
 	// Without ever altering the quotas on the account, a single region can have: 10 x 15 = 150 subnets
 	// Default limit on subnets returned from VPC in a single call: 50  (maximum = 100)
 	// Since there is no way to filter the subnet results, pagination will need to be used.
+	// RIaaS request was made to allow subnets to be filtered based on VPC id: https://jiracloud.swg.usma.ibm.com:8443/browse/RNOS-3427
 	var start *string
 	for {
 		list, response, err := v.Client.ListSubnets(&sdk.ListSubnetsOptions{Start: start})
@@ -453,6 +699,34 @@ func (v *VpcSdkGen2) ListSubnets() ([]*VpcSubnet, error) {
 		start = core.StringPtr(qryArgs.Get("start"))
 	}
 	return subnets, nil
+}
+
+// ListVPCs - return list of VPCs
+func (v *VpcSdkGen2) ListVPCs() ([]*Vpc, error) {
+	vpcs := []*Vpc{}
+	var start *string
+	for {
+		list, response, err := v.Client.ListVpcs(&sdk.ListVpcsOptions{Start: start})
+		if err != nil {
+			v.logResponseError(response)
+			return vpcs, err
+		}
+		for _, item := range list.Vpcs {
+			vpcs = append(vpcs, v.mapVpc(item))
+		}
+		// Check to see if more need to be retrieved
+		if list.Next == nil || list.Next.Href == nil {
+			break
+		}
+		// We need to pull out the "start" query value and re-issue the call to RIaaS to get the next block of objects
+		u, err := url.Parse(*list.Next.Href)
+		if err != nil {
+			return vpcs, err
+		}
+		qryArgs := u.Query()
+		start = core.StringPtr(qryArgs.Get("start"))
+	}
+	return vpcs, nil
 }
 
 // logResponseError - write the response details to stdout so it will appear in logs
@@ -500,6 +774,10 @@ func (v *VpcSdkGen2) mapLoadBalancer(item sdk.LoadBalancer) *VpcLoadBalancer {
 	if item.ResourceGroup != nil {
 		lb.ResourceGroup = VpcObjectReference{ID: SafePointerString(item.ResourceGroup.ID), Name: SafePointerString(item.ResourceGroup.Name)}
 	}
+	// SecurityGroups
+	for _, secGroup := range item.SecurityGroups {
+		lb.SecurityGroups = append(lb.SecurityGroups, VpcObjectReference{ID: SafePointerString(secGroup.ID), Name: SafePointerString(secGroup.Name)})
+	}
 	// Subnets
 	for _, subnetRef := range item.Subnets {
 		lb.Subnets = append(lb.Subnets, VpcObjectReference{ID: SafePointerString(subnetRef.ID), Name: SafePointerString(subnetRef.Name)})
@@ -511,10 +789,18 @@ func (v *VpcSdkGen2) mapLoadBalancer(item sdk.LoadBalancer) *VpcLoadBalancer {
 func (v *VpcSdkGen2) mapLoadBalancerListener(item sdk.LoadBalancerListener) *VpcLoadBalancerListener {
 	listener := &VpcLoadBalancerListener{
 		ConnectionLimit:    SafePointerInt64(item.ConnectionLimit),
+		IdleConnTimeout:    SafePointerInt64(item.IdleConnectionTimeout),
 		ID:                 SafePointerString(item.ID),
-		Port:               SafePointerInt64(item.Port),
+		PortMin:            SafePointerInt64(item.PortMin),
+		PortMax:            SafePointerInt64(item.PortMax),
 		Protocol:           SafePointerString(item.Protocol),
 		ProvisioningStatus: SafePointerString(item.ProvisioningStatus),
+	}
+	if listener.PortMin == 0 {
+		listener.PortMin = SafePointerInt64(item.Port)
+	}
+	if listener.PortMax == 0 {
+		listener.PortMax = listener.PortMin
 	}
 	if item.DefaultPool != nil {
 		listener.DefaultPool = VpcObjectReference{ID: SafePointerString(item.DefaultPool.ID), Name: SafePointerString(item.DefaultPool.Name)}
@@ -574,6 +860,124 @@ func (v *VpcSdkGen2) mapLoadBalancerPoolMember(item sdk.LoadBalancerPoolMember) 
 	return member
 }
 
+// mapNetworkACL - map the vpcv1 NetworkAcl to generic format
+func (v *VpcSdkGen2) mapNetworkACL(item sdk.NetworkACL) *VpcNetworkACL {
+	netACL := &VpcNetworkACL{
+		SdkObject: item,
+		CreatedAt: SafePointerDate(item.CreatedAt),
+		ID:        SafePointerString(item.ID),
+		Name:      SafePointerString(item.Name),
+	}
+	// ResourceGroup
+	if item.ResourceGroup != nil {
+		netACL.ResourceGroup = VpcObjectReference{ID: SafePointerString(item.ResourceGroup.ID), Name: SafePointerString(item.ResourceGroup.Name)}
+	}
+	// Rules
+	for _, rule := range item.Rules {
+		netACL.Rules = append(netACL.Rules, *v.mapNetworkACLRule(rule))
+	}
+	// Vpc
+	if item.VPC != nil {
+		netACL.Vpc = VpcObjectReference{ID: SafePointerString(item.VPC.ID), Name: SafePointerString(item.VPC.Name)}
+	}
+	return netACL
+}
+
+// mapNetworkACLRule - map the NetworkAclRule to generic format
+func (v *VpcSdkGen2) mapNetworkACLRule(item sdk.NetworkACLRuleItemIntf) *VpcNetworkACLRule {
+	return &VpcNetworkACLRule{
+		SdkObject: item,
+	}
+}
+
+// mapSecurityGroup - map the SecurityGroup to generic format
+func (v *VpcSdkGen2) mapSecurityGroup(item sdk.SecurityGroup) *VpcSecurityGroup {
+	secGroup := &VpcSecurityGroup{
+		SdkObject: item,
+		CreatedAt: SafePointerDate(item.CreatedAt),
+		ID:        SafePointerString(item.ID),
+		Name:      SafePointerString(item.Name),
+	}
+	// ResourceGroup
+	if item.ResourceGroup != nil {
+		secGroup.ResourceGroup = VpcObjectReference{ID: SafePointerString(item.ResourceGroup.ID), Name: SafePointerString(item.ResourceGroup.Name)}
+	}
+	// Rules
+	for _, rule := range item.Rules {
+		secGroup.Rules = append(secGroup.Rules, *v.mapSecurityGroupRule(rule))
+	}
+	// Targets
+	for _, target := range item.Targets {
+		secGroup.Targets = append(secGroup.Targets, *v.mapSecurityGroupTarget(target))
+	}
+	// Vpc
+	if item.VPC != nil {
+		secGroup.Vpc = VpcObjectReference{ID: SafePointerString(item.VPC.ID), Name: SafePointerString(item.VPC.Name)}
+	}
+	return secGroup
+}
+
+// mapSecurityGroupRule - map the SecurityGroupRule to generic format
+func (v *VpcSdkGen2) mapSecurityGroupRule(item sdk.SecurityGroupRuleIntf) *VpcSecurityGroupRule {
+	rule := &VpcSecurityGroupRule{SdkObject: item}
+	switch ruleType := item.(type) {
+	case *sdk.SecurityGroupRuleSecurityGroupRuleProtocolAll:
+		rule.Direction = SafePointerString(ruleType.Direction)
+		rule.ID = SafePointerString(ruleType.ID)
+		rule.IPVersion = SafePointerString(ruleType.IPVersion)
+		rule.Protocol = SafePointerString(ruleType.Protocol)
+		rule.Remote = v.mapSecurityGroupRuleRemote(ruleType.Remote)
+	case *sdk.SecurityGroupRuleSecurityGroupRuleProtocolIcmp:
+		rule.Direction = SafePointerString(ruleType.Direction)
+		rule.ID = SafePointerString(ruleType.ID)
+		rule.IPVersion = SafePointerString(ruleType.IPVersion)
+		rule.Protocol = SafePointerString(ruleType.Protocol)
+		rule.Remote = v.mapSecurityGroupRuleRemote(ruleType.Remote)
+	case *sdk.SecurityGroupRuleSecurityGroupRuleProtocolTcpudp:
+		rule.Direction = SafePointerString(ruleType.Direction)
+		rule.ID = SafePointerString(ruleType.ID)
+		rule.IPVersion = SafePointerString(ruleType.IPVersion)
+		rule.PortMax = SafePointerInt64(ruleType.PortMax)
+		rule.PortMin = SafePointerInt64(ruleType.PortMin)
+		rule.Protocol = SafePointerString(ruleType.Protocol)
+		rule.Remote = v.mapSecurityGroupRuleRemote(ruleType.Remote)
+	}
+	return rule
+}
+
+// mapSecurityGroupRemote - map the SecurityGroupRuleRemote to generic format
+func (v *VpcSdkGen2) mapSecurityGroupRuleRemote(item sdk.SecurityGroupRuleRemoteIntf) VpcSecurityGroupRuleRemote {
+	remote := VpcSecurityGroupRuleRemote{}
+	switch remoteType := item.(type) {
+	case *sdk.SecurityGroupRuleRemoteCIDR:
+		remote.CIDRBlock = SafePointerString(remoteType.CIDRBlock)
+	case *sdk.SecurityGroupRuleRemoteIP:
+		remote.Address = SafePointerString(remoteType.Address)
+	case *sdk.SecurityGroupRuleRemoteSecurityGroupReference:
+		remote.ID = SafePointerString(remoteType.ID)
+		remote.Name = SafePointerString(remoteType.Name)
+	case *sdk.SecurityGroupRuleRemote:
+		if remoteType.CIDRBlock != nil {
+			remote.CIDRBlock = SafePointerString(remoteType.CIDRBlock)
+		}
+		if remoteType.Address != nil {
+			remote.Address = SafePointerString(remoteType.Address)
+		}
+		if remoteType.ID != nil {
+			remote.ID = SafePointerString(remoteType.ID)
+		}
+		if remoteType.Name != nil {
+			remote.Name = SafePointerString(remoteType.Name)
+		}
+	}
+	return remote
+}
+
+// mapSecurityGroupTarget - map the SecurityGroupTargetReference to generic format
+func (v *VpcSdkGen2) mapSecurityGroupTarget(item sdk.SecurityGroupTargetReferenceIntf) *VpcSecurityGroupTarget {
+	return &VpcSecurityGroupTarget{SdkObject: item}
+}
+
 // mapSubnet - map the Subnet to generic format
 func (v *VpcSdkGen2) mapSubnet(item sdk.Subnet) *VpcSubnet {
 	subnet := &VpcSubnet{
@@ -610,8 +1014,44 @@ func (v *VpcSdkGen2) mapSubnet(item sdk.Subnet) *VpcSubnet {
 	return subnet
 }
 
+// mapVpc - map the Vpc to generic format
+func (v *VpcSdkGen2) mapVpc(item sdk.VPC) *Vpc {
+	vpc := &Vpc{
+		SdkObject:     item,
+		ClassicAccess: SafePointerBool(item.ClassicAccess),
+		CreatedAt:     SafePointerDate(item.CreatedAt),
+		ID:            SafePointerString(item.ID),
+		Name:          SafePointerString(item.Name),
+		Status:        SafePointerString(item.Status),
+	}
+	// CseSourceIP
+	for _, CseSourceIP := range item.CseSourceIps {
+		cseString := ""
+		if CseSourceIP.IP != nil {
+			cseString += fmt.Sprintf("IP:%s ", SafePointerString(CseSourceIP.IP.Address))
+		}
+		if CseSourceIP.Zone != nil {
+			cseString += fmt.Sprintf("Zone:%s", SafePointerString(CseSourceIP.Zone.Name))
+		}
+		vpc.CseSourceIPs = append(vpc.CseSourceIPs, cseString)
+	}
+	// DefaultNetworkACL
+	if item.DefaultNetworkACL != nil {
+		vpc.DefaultNetworkACL = VpcObjectReference{ID: SafePointerString(item.DefaultNetworkACL.ID), Name: SafePointerString(item.DefaultNetworkACL.Name)}
+	}
+	// DefaultSecurityGroup
+	if item.DefaultSecurityGroup != nil {
+		vpc.DefaultSecurityGroup = VpcObjectReference{ID: SafePointerString(item.DefaultSecurityGroup.ID), Name: SafePointerString(item.DefaultSecurityGroup.Name)}
+	}
+	// ResourceGroup
+	if item.ResourceGroup != nil {
+		vpc.ResourceGroup = VpcObjectReference{ID: SafePointerString(item.ResourceGroup.ID), Name: SafePointerString(item.ResourceGroup.Name)}
+	}
+	return vpc
+}
+
 // ReplaceLoadBalancerPoolMembers - update a load balancer pool members
-func (v *VpcSdkGen2) ReplaceLoadBalancerPoolMembers(lbID, poolName, poolID string, nodeList []string) ([]*VpcLoadBalancerPoolMember, error) {
+func (v *VpcSdkGen2) ReplaceLoadBalancerPoolMembers(lbID, poolName, poolID string, nodeList []string, options *ServiceOptions) ([]*VpcLoadBalancerPoolMember, error) {
 	// Extract values from poolName
 	poolNameFields, err := extractFieldsFromPoolName(poolName)
 	if err != nil {
@@ -621,9 +1061,12 @@ func (v *VpcSdkGen2) ReplaceLoadBalancerPoolMembers(lbID, poolName, poolID strin
 	replaceOptions := &sdk.ReplaceLoadBalancerPoolMembersOptions{
 		LoadBalancerID: core.StringPtr(lbID),
 		PoolID:         core.StringPtr(poolID),
-		Members:        v.genLoadBalancerMembers(poolNameFields.NodePort, nodeList),
+		Members:        v.genLoadBalancerMembers(poolNameFields.NodePort, nodeList, options),
 	}
 	// Update the VPC LB pool member
+	if options.isNLB() {
+		replaceOptions.Headers = map[string]string{"x-instance-account-id": v.Config.WorkerAccountID}
+	}
 	list, response, err := v.Client.ReplaceLoadBalancerPoolMembers(replaceOptions)
 	if err != nil {
 		v.logResponseError(response)
@@ -637,6 +1080,43 @@ func (v *VpcSdkGen2) ReplaceLoadBalancerPoolMembers(lbID, poolName, poolID strin
 	return members, nil
 }
 
+// UpdateLoadBalancer - update a load balancer
+func (v *VpcSdkGen2) UpdateLoadBalancer(lbID string, updateList, nodeList, poolList []string, options *ServiceOptions) error {
+	// Updates to the LB are handled by the other routines
+	return nil
+}
+
+// UpdateLoadBalancerListener - update a load balancer listener
+func (v *VpcSdkGen2) UpdateLoadBalancerListener(lbID, listenerID string, options *ServiceOptions) (*VpcLoadBalancerListener, error) {
+	// Make sure that we are not attempting to update a NLB (this check should never trigger, NLB checked earlier)
+	if options.isNLB() {
+		return nil, fmt.Errorf("NLB does not support updating load balancer listeners")
+	}
+	// Initialize the LoadBalancerListenerPatch
+	updateListener := &sdk.LoadBalancerListenerPatch{
+		IdleConnectionTimeout: core.Int64Ptr(int64(options.getIdleConnectionTimeout())),
+	}
+	updatePatch, err := updateListener.AsPatch()
+	if err != nil {
+		return nil, err
+	}
+	// Initialize the UpdateLoadBalancerListenerOptions
+	updateOptions := &sdk.UpdateLoadBalancerListenerOptions{
+		LoadBalancerID:            core.StringPtr(lbID),
+		ID:                        core.StringPtr(listenerID),
+		LoadBalancerListenerPatch: updatePatch,
+	}
+	// Update the VPC LB listener
+	listener, response, err := v.Client.UpdateLoadBalancerListener(updateOptions)
+	if err != nil {
+		v.logResponseError(response)
+		return nil, err
+	}
+
+	// Map the generated object back to the common format
+	return v.mapLoadBalancerListener(*listener), nil
+}
+
 // UpdateLoadBalancerPool - update a load balancer pool
 func (v *VpcSdkGen2) UpdateLoadBalancerPool(lbID, newPoolName string, existingPool *VpcLoadBalancerPool, options *ServiceOptions) (*VpcLoadBalancerPool, error) {
 	// Extract values from poolName
@@ -645,21 +1125,47 @@ func (v *VpcSdkGen2) UpdateLoadBalancerPool(lbID, newPoolName string, existingPo
 		return nil, err
 	}
 	proxyProtocolRequested := options.isProxyProtocol()
+	proxyProtocolSupported := !options.isNLB()
+	// LoadBalancerOptionLeastConnections is not currently supported
+	// See issue: https://github.ibm.com/alchemy-containers/armada-network/issues/3503
+	//
+	// algorithm := sdk.LoadBalancerPoolPatchAlgorithmRoundRobinConst
+	// if isVpcOptionEnabled(options, LoadBalancerOptionLeastConnections) {
+	// 	algorithm = sdk.LoadBalancerPoolPatchAlgorithmLeastConnectionsConst
+	// }
+	//
+	// Initialize the LoadBalancerPoolPatch. Set those options that can be updated
 	updatePool := &sdk.LoadBalancerPoolPatch{
 		// Algorithm:  core.StringPtr(algorithm),
-		HealthMonitor: v.genLoadBalancerHealthMonitorUpdate(poolNameFields.NodePort, options.getHealthCheckNodePort()),
-		Name:          core.StringPtr(newPoolName),
+		HealthMonitor: v.genLoadBalancerHealthMonitorUpdate(poolNameFields, options),
 	}
-	if proxyProtocolRequested && existingPool.ProxyProtocol != sdk.LoadBalancerPoolProxyProtocolV1Const {
-		updatePool.ProxyProtocol = core.StringPtr(sdk.LoadBalancerPoolProxyProtocolV1Const)
+	// Only update the pool name if it has changed
+	if newPoolName != existingPool.Name {
+		updatePool.Name = core.StringPtr(newPoolName)
 	}
-	if !proxyProtocolRequested && existingPool.ProxyProtocol != sdk.LoadBalancerPoolProxyProtocolDisabledConst {
-		updatePool.ProxyProtocol = core.StringPtr(sdk.LoadBalancerPoolProxyProtocolDisabledConst)
+	// Only update the proxy-protocol value if VPC supports it -AND- the value has changed
+	if proxyProtocolSupported {
+		if proxyProtocolRequested && existingPool.ProxyProtocol != sdk.LoadBalancerPoolProxyProtocolV1Const {
+			updatePool.ProxyProtocol = core.StringPtr(sdk.LoadBalancerPoolProxyProtocolV1Const)
+		}
+		if !proxyProtocolRequested && existingPool.ProxyProtocol != sdk.LoadBalancerPoolProxyProtocolDisabledConst {
+			updatePool.ProxyProtocol = core.StringPtr(sdk.LoadBalancerPoolProxyProtocolDisabledConst)
+		}
 	}
 	updatePatch, err := updatePool.AsPatch()
 	if err != nil {
 		return nil, err
 	}
+	// LoadBalancerOptionSessionAffinity is not currently supported
+	// See issue: https://github.ibm.com/alchemy-containers/armada-network/issues/3470
+	//
+	// Session affinity must be set after the updatePatch is created so that "nil" can be used to un-set the session affinity
+	// if isVpcOptionEnabled(options, LoadBalancerOptionSessionAffinity) {
+	// 	updatePatch["session_persistence"] = map[string]string{"type": sdk.LoadBalancerPoolSessionPersistencePatchTypeSourceIPConst}
+	// } else {
+	// 	updatePatch["session_persistence"] = nil
+	// }
+	//
 	// Initialize the update pool options
 	updateOptions := &sdk.UpdateLoadBalancerPoolOptions{
 		LoadBalancerID:        core.StringPtr(lbID),
@@ -675,4 +1181,46 @@ func (v *VpcSdkGen2) UpdateLoadBalancerPool(lbID, newPoolName string, existingPo
 
 	// Map the generated object back to the common format
 	return v.mapLoadBalancerPool(*pool), nil
+}
+
+// UpdateLoadBalancerSubnets - update a load balancer subnets
+func (v *VpcSdkGen2) UpdateLoadBalancerSubnets(lbID string, subnetList []string, options *ServiceOptions) (*VpcLoadBalancer, error) {
+	// We need to determine the "Etag" for the load balancer resource because this is required on the update
+	// Retrieve the individual load balacner and extract the "Etag" from the headers
+	_, response, err := v.Client.GetLoadBalancer(&sdk.GetLoadBalancerOptions{ID: &lbID})
+	if err != nil {
+		v.logResponseError(response)
+		return nil, err
+	}
+	eTag := response.Headers.Get("Etag")
+	if eTag == "" {
+		return nil, fmt.Errorf("Unable to determine ETag for the load balancer resource")
+	}
+	// Convert the list of subnet IDs over to the correct VPC subnet identity array
+	subnetIds := []sdk.SubnetIdentityIntf{}
+	for _, subnet := range subnetList {
+		subnetIds = append(subnetIds, &sdk.SubnetIdentity{ID: core.StringPtr(subnet)})
+	}
+	// Initialize the subnets in the LoadBalancerPatch.  We are not patching any of the other fields
+	updateSubnets := &sdk.LoadBalancerPatch{
+		Subnets: subnetIds,
+	}
+	// Create the patch
+	updatePatch, err := updateSubnets.AsPatch()
+	if err != nil {
+		return nil, err
+	}
+	// Initialize the update options
+	updateOptions := &sdk.UpdateLoadBalancerOptions{
+		IfMatch:           core.StringPtr(eTag),
+		ID:                core.StringPtr(lbID),
+		LoadBalancerPatch: updatePatch,
+	}
+	// Finally, update the load balancer
+	lb, response, err := v.Client.UpdateLoadBalancer(updateOptions)
+	if err != nil {
+		v.logResponseError(response)
+		return nil, err
+	}
+	return v.mapLoadBalancer(*lb), nil
 }

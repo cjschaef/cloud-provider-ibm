@@ -1,6 +1,6 @@
 /*******************************************************************************
 * IBM Cloud Kubernetes Service, 5737-D43
-* (C) Copyright IBM Corp. 2021, 2022 All Rights Reserved.
+* (C) Copyright IBM Corp. 2021, 2023 All Rights Reserved.
 *
 * SPDX-License-Identifier: Apache2.0
 *
@@ -62,6 +62,7 @@ func TestVpcSdkGen2_CreateLoadBalancer(t *testing.T) {
 	nodes := []string{"192.168.1.1"}
 	pools := []string{"tcp-80-30303"}
 	subnets := []string{"subnetID"}
+	options.enabledFeatures = LoadBalancerOptionProxyProtocol
 	lb, err = v.CreateLoadBalancer("lbName", nodes, pools, subnets, options)
 	assert.NotNil(t, lb)
 	assert.Nil(t, err)
@@ -79,13 +80,14 @@ func TestVpcSdkGen2_CreateLoadBalancerListener(t *testing.T) {
 	v := newNoAuthTestVpcSdkGen2(server.URL)
 
 	// Invalid pool name
-	listener, err := v.CreateLoadBalancerListener("lbID", "poolName", "poolID")
+	options := newServiceOptions()
+	listener, err := v.CreateLoadBalancerListener("lbID", "poolName", "poolID", options)
 	assert.Nil(t, listener)
 	assert.NotNil(t, err)
 	assert.Contains(t, err.Error(), "Invalid pool name")
 
 	// Success
-	listener, err = v.CreateLoadBalancerListener("lbID", "tcp-80-30123", "poolID")
+	listener, err = v.CreateLoadBalancerListener("lbID", "tcp-80-30123", "poolID", options)
 	assert.NotNil(t, listener)
 	assert.Nil(t, err)
 }
@@ -127,14 +129,32 @@ func TestVpcSdkGen2_CreateLoadBalancerPoolMember(t *testing.T) {
 	v := newNoAuthTestVpcSdkGen2(server.URL)
 
 	// Invalid pool name
-	member, err := v.CreateLoadBalancerPoolMember("lbID", "poolName", "poolID", "192.168.1.1")
+	options := newServiceOptions()
+	member, err := v.CreateLoadBalancerPoolMember("lbID", "poolName", "poolID", "192.168.1.1", options)
 	assert.Nil(t, member)
 	assert.NotNil(t, err)
 	assert.Contains(t, err.Error(), "Invalid pool name")
 
 	// Success
-	member, err = v.CreateLoadBalancerPoolMember("lbID", "tcp-80-30123", "poolID", "192.168.1.1")
+	member, err = v.CreateLoadBalancerPoolMember("lbID", "tcp-80-30123", "poolID", "192.168.1.1", options)
 	assert.NotNil(t, member)
+	assert.Nil(t, err)
+}
+
+func TestVpcSdkGen2_CreateSecurityGroupRule(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		res.Header().Set("Content-type", "application/json")
+		res.WriteHeader(201)
+		fmt.Fprintf(res, "%s", `{"direction": "inbound", "href": "https://us-south.iaas.cloud.ibm.com/v1/security_groups/be5df5ca-12a0-494b-907e-aa6ec2bfa271/rules/6f2a6efe-21e2-401c-b237-620aa26ba16a", "id": "6f2a6efe-21e2-401c-b237-620aa26ba16a", "ip_version": "ipv4", "remote": {"address": "192.168.3.4"}, "protocol": "all"}`)
+	}))
+	defer server.Close()
+
+	// Create the VPC client and SDK interface
+	v := newNoAuthTestVpcSdkGen2(server.URL)
+
+	// Success
+	sgRule, err := v.CreateSecurityGroupRule("secGroupID", "inbound", "tcp", 80, 80, "")
+	assert.NotNil(t, sgRule)
 	assert.Nil(t, err)
 }
 
@@ -153,11 +173,11 @@ func TestVpcSdkGen2_DeleteLoadBalancer(t *testing.T) {
 	v := newNoAuthTestVpcSdkGen2(server.URL)
 
 	// Success
-	err := v.DeleteLoadBalancer("loadBalancerID_123")
+	err := v.DeleteLoadBalancer("loadBalancerID_123", nil)
 	assert.Nil(t, err)
 
 	// Error
-	err = v.DeleteLoadBalancer("loadBalancerID_999")
+	err = v.DeleteLoadBalancer("loadBalancerID_999", nil)
 	assert.NotNil(t, err)
 }
 
@@ -230,6 +250,29 @@ func TestVpcSdkGen2_DeleteLoadBalancerPoolMember(t *testing.T) {
 	assert.NotNil(t, err)
 }
 
+func TestVpcSdkGen2_DeleteSecurityGroupRule(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		res.Header().Set("Content-type", "application/json")
+		if strings.Contains(req.URL.String(), "valid-ruleID") {
+			res.WriteHeader(204)
+		} else {
+			res.WriteHeader(404)
+		}
+	}))
+	defer server.Close()
+
+	// Create the VPC client and SDK interface
+	v := newNoAuthTestVpcSdkGen2(server.URL)
+
+	// Success
+	err := v.DeleteSecurityGroupRule("securityGroupID", "valid-ruleID")
+	assert.Nil(t, err)
+
+	// Error
+	err = v.DeleteSecurityGroupRule("securityGroupID", "bad-ruleID")
+	assert.NotNil(t, err)
+}
+
 func TestVpcSdkGen2_GetLoadBalancer(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
 		res.Header().Set("Content-type", "application/json")
@@ -247,10 +290,28 @@ func TestVpcSdkGen2_GetLoadBalancer(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Equal(t, lb.ID, "dd754295-e9e0-4c9d-bf6c-58fbc59e5727")
 	assert.Equal(t, lb.IsPublic, true)
+	assert.Equal(t, lb.IsService, false)
 	assert.Equal(t, lb.Name, "my-load-balancer")
 	assert.Equal(t, lb.PrivateIps[0], "192.168.33.44")
 	assert.Equal(t, lb.PublicIps[0], "192.168.3.4")
 	assert.Equal(t, lb.Subnets[0].ID, "7ec86020-1c6e-4889-b3f0-a15f2e50f87e")
+}
+
+func TestVpcSdkGen2_GetSecurityGroup(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		res.Header().Set("Content-type", "application/json")
+		res.WriteHeader(200)
+		fmt.Fprintf(res, `{"created_at": "2019-01-01T12:00:00", "crn": "crn:v1:bluemix:public:is:us-south:a/123456::security-group:be5df5ca-12a0-494b-907e-aa6ec2bfa271", "href": "https://us-south.iaas.cloud.ibm.com/v1/security_groups/be5df5ca-12a0-494b-907e-aa6ec2bfa271", "id": "be5df5ca-12a0-494b-907e-aa6ec2bfa271", "name": "my-security-group", "network_interfaces": [{"href": "https://us-south.iaas.cloud.ibm.com/v1/instances/1e09281b-f177-46fb-baf1-bc152b2e391a/network_interfaces/10c02d81-0ecb-4dc5-897d-28392913b81e", "id": "10c02d81-0ecb-4dc5-897d-28392913b81e", "name": "my-network-interface", "primary_ipv4_address": "PrimaryIpv4Address", "resource_type": "network_interface"}], "resource_group": {"href": "https://resource-controller.cloud.ibm.com/v2/resource_groups/fee82deba12e4c0fb69c3b09d1f12345", "id": "fee82deba12e4c0fb69c3b09d1f12345", "name": "my-resource-group"}, "rules": [{"direction": "inbound", "href": "https://us-south.iaas.cloud.ibm.com/v1/security_groups/be5df5ca-12a0-494b-907e-aa6ec2bfa271/rules/6f2a6efe-21e2-401c-b237-620aa26ba16a", "id": "6f2a6efe-21e2-401c-b237-620aa26ba16a", "ip_version": "ipv4", "protocol": "all", "remote": {"address": "192.168.3.4"}}], "vpc": {"crn": "crn:v1:bluemix:public:is:us-south:a/123456::vpc:4727d842-f94f-4a2d-824a-9bc9b02c523b", "href": "https://us-south.iaas.cloud.ibm.com/v1/vpcs/4727d842-f94f-4a2d-824a-9bc9b02c523b", "id": "4727d842-f94f-4a2d-824a-9bc9b02c523b", "name": "my-vpc"}}`)
+	}))
+	defer server.Close()
+
+	// Create the VPC client and SDK interface
+	v := newNoAuthTestVpcSdkGen2(server.URL)
+
+	// Success
+	secGroup, err := v.GetSecurityGroup("securityGroupID")
+	assert.NotNil(t, secGroup)
+	assert.Nil(t, err)
 }
 
 func TestVpcSdkGen2_GetSubnet(t *testing.T) {
@@ -267,6 +328,23 @@ func TestVpcSdkGen2_GetSubnet(t *testing.T) {
 	// Success
 	subnet, err := v.GetSubnet("subnet id")
 	assert.NotNil(t, subnet)
+	assert.Nil(t, err)
+}
+
+func TestVpcSdkGen2_GetVPC(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		res.Header().Set("Content-type", "application/json")
+		res.WriteHeader(200)
+		fmt.Fprintf(res, `{"classic_access": false, "created_at": "2019-01-01T12:00:00", "crn": "crn:v1:bluemix:public:is:us-south:a/123456::vpc:4727d842-f94f-4a2d-824a-9bc9b02c523b", "cse_source_ips": [{"ip": {"address": "192.168.3.4"}, "zone": {"href": "https://us-south.iaas.cloud.ibm.com/v1/regions/us-south/zones/us-south-1", "name": "us-south-1"}}], "default_network_acl": {"crn": "crn:v1:bluemix:public:is:us-south:a/123456::network-acl:a4e28308-8ee7-46ab-8108-9f881f22bdbf", "href": "https://us-south.iaas.cloud.ibm.com/v1/network_acls/a4e28308-8ee7-46ab-8108-9f881f22bdbf", "id": "a4e28308-8ee7-46ab-8108-9f881f22bdbf", "name": "my-network-acl"}, "default_security_group": {"crn": "crn:v1:bluemix:public:is:us-south:a/123456::security-group:be5df5ca-12a0-494b-907e-aa6ec2bfa271", "href": "https://us-south.iaas.cloud.ibm.com/v1/security_groups/be5df5ca-12a0-494b-907e-aa6ec2bfa271", "id": "be5df5ca-12a0-494b-907e-aa6ec2bfa271", "name": "my-security-group"}, "href": "https://us-south.iaas.cloud.ibm.com/v1/vpcs/4727d842-f94f-4a2d-824a-9bc9b02c523b", "id": "4727d842-f94f-4a2d-824a-9bc9b02c523b", "name": "my-vpc", "resource_group": {"href": "https://resource-controller.cloud.ibm.com/v2/resource_groups/fee82deba12e4c0fb69c3b09d1f12345", "id": "fee82deba12e4c0fb69c3b09d1f12345", "name": "my-resource-group"}, "status": "available"}`)
+	}))
+	defer server.Close()
+
+	// Create the VPC client and SDK interface
+	v := newNoAuthTestVpcSdkGen2(server.URL)
+
+	// Success
+	vpc, err := v.GetVPC("vpcID")
+	assert.NotNil(t, vpc)
 	assert.Nil(t, err)
 }
 
@@ -347,6 +425,40 @@ func TestVpcSdkGen2_ListLoadBalancerPoolMembers(t *testing.T) {
 	assert.Equal(t, members[0].ID, "70294e14-4e61-11e8-bcf4-0242ac110004")
 }
 
+func TestVpcSdkGen2_ListNetworkACLs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		res.Header().Set("Content-type", "application/json")
+		res.WriteHeader(200)
+		fmt.Fprintf(res, `{"first": {"href": "https://us-south.iaas.cloud.ibm.com/v1/network_acls?limit=20"}, "limit": 20, "network_acls": [{"created_at": "2019-01-01T12:00:00.000Z", "crn": "crn:v1:bluemix:public:is:us-south:a/123456::network-acl:a4e28308-8ee7-46ab-8108-9f881f22bdbf", "href": "https://us-south.iaas.cloud.ibm.com/v1/network_acls/a4e28308-8ee7-46ab-8108-9f881f22bdbf", "id": "a4e28308-8ee7-46ab-8108-9f881f22bdbf", "name": "my-network-acl", "resource_group": {"href": "https://resource-controller.cloud.ibm.com/v2/resource_groups/fee82deba12e4c0fb69c3b09d1f12345", "id": "fee82deba12e4c0fb69c3b09d1f12345", "name": "my-resource-group"}, "rules": [{"action": "allow", "before": {"deleted": {"more_info": "https://cloud.ibm.com/apidocs/vpc#deleted-resources"}, "href": "https://us-south.iaas.cloud.ibm.com/v1/network_acls/a4e28308-8ee7-46ab-8108-9f881f22bdbf/rules/8daca77a-4980-4d33-8f3e-7038797be8f9", "id": "8daca77a-4980-4d33-8f3e-7038797be8f9", "name": "my-rule-1"}, "created_at": "2019-01-01T12:00:00.000Z", "destination": "192.168.3.0/24", "direction": "inbound", "href": "https://us-south.iaas.cloud.ibm.com/v1/network_acls/a4e28308-8ee7-46ab-8108-9f881f22bdbf/rules/8daca77a-4980-4d33-8f3e-7038797be8f9", "id": "8daca77a-4980-4d33-8f3e-7038797be8f9", "ip_version": "ipv4", "name": "my-rule-2", "source": "192.168.3.0/24", "destination_port_max": 22, "destination_port_min": 22, "protocol": "udp", "source_port_max": 65535, "source_port_min": 49152}], "subnets": [{"crn": "crn:v1:bluemix:public:is:us-south-1:a/123456::subnet:7ec86020-1c6e-4889-b3f0-a15f2e50f87e", "deleted": {"more_info": "https://cloud.ibm.com/apidocs/vpc#deleted-resources"}, "href": "https://us-south.iaas.cloud.ibm.com/v1/subnets/7ec86020-1c6e-4889-b3f0-a15f2e50f87e", "id": "7ec86020-1c6e-4889-b3f0-a15f2e50f87e", "name": "my-subnet"}], "vpc": {"crn": "crn:v1:bluemix:public:is:us-south:a/123456::vpc:4727d842-f94f-4a2d-824a-9bc9b02c523b", "deleted": {"more_info": "https://cloud.ibm.com/apidocs/vpc#deleted-resources"}, "href": "https://us-south.iaas.cloud.ibm.com/v1/vpcs/4727d842-f94f-4a2d-824a-9bc9b02c523b", "id": "4727d842-f94f-4a2d-824a-9bc9b02c523b", "name": "my-vpc"}}], "total_count": 132}`)
+	}))
+	defer server.Close()
+
+	// Create the VPC client and SDK interface
+	v := newNoAuthTestVpcSdkGen2(server.URL)
+
+	// Success
+	acls, err := v.ListNetworkACLs()
+	assert.Equal(t, len(acls), 1)
+	assert.Nil(t, err)
+}
+
+func TestVpcSdkGen2_ListSecurityGroups(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		res.Header().Set("Content-type", "application/json")
+		res.WriteHeader(200)
+		fmt.Fprintf(res, `{"first": {"href": "https://us-south.iaas.cloud.ibm.com/v1/security_groups?limit=20"}, "limit": 20, "security_groups": [{"created_at": "2019-01-01T12:00:00", "crn": "crn:v1:bluemix:public:is:us-south:a/123456::security-group:be5df5ca-12a0-494b-907e-aa6ec2bfa271", "href": "https://us-south.iaas.cloud.ibm.com/v1/security_groups/be5df5ca-12a0-494b-907e-aa6ec2bfa271", "id": "be5df5ca-12a0-494b-907e-aa6ec2bfa271", "name": "my-security-group", "network_interfaces": [{"href": "https://us-south.iaas.cloud.ibm.com/v1/instances/1e09281b-f177-46fb-baf1-bc152b2e391a/network_interfaces/10c02d81-0ecb-4dc5-897d-28392913b81e", "id": "10c02d81-0ecb-4dc5-897d-28392913b81e", "name": "my-network-interface", "primary_ipv4_address": "PrimaryIpv4Address", "resource_type": "network_interface"}], "resource_group": {"href": "https://resource-controller.cloud.ibm.com/v2/resource_groups/fee82deba12e4c0fb69c3b09d1f12345", "id": "fee82deba12e4c0fb69c3b09d1f12345", "name": "my-resource-group"}, "rules": [{"direction": "inbound", "href": "https://us-south.iaas.cloud.ibm.com/v1/security_groups/be5df5ca-12a0-494b-907e-aa6ec2bfa271/rules/6f2a6efe-21e2-401c-b237-620aa26ba16a", "id": "6f2a6efe-21e2-401c-b237-620aa26ba16a", "ip_version": "ipv4", "protocol": "all", "remote": {"address": "192.168.3.4"}}], "vpc": {"crn": "crn:v1:bluemix:public:is:us-south:a/123456::vpc:4727d842-f94f-4a2d-824a-9bc9b02c523b", "href": "https://us-south.iaas.cloud.ibm.com/v1/vpcs/4727d842-f94f-4a2d-824a-9bc9b02c523b", "id": "4727d842-f94f-4a2d-824a-9bc9b02c523b", "name": "my-vpc"}}], "total_count": 132}`)
+	}))
+	defer server.Close()
+
+	// Create the VPC client and SDK interface
+	v := newNoAuthTestVpcSdkGen2(server.URL)
+
+	// Success
+	secGroups, err := v.ListSecurityGroups("")
+	assert.Equal(t, len(secGroups), 1)
+	assert.Nil(t, err)
+}
+
 func TestVpcSdkGen2_ListSubnets(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
 		res.Header().Set("Content-type", "application/json")
@@ -364,6 +476,23 @@ func TestVpcSdkGen2_ListSubnets(t *testing.T) {
 	assert.Nil(t, err)
 }
 
+func TestVpcSdkGen2_ListVPCs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		res.Header().Set("Content-type", "application/json")
+		res.WriteHeader(200)
+		fmt.Fprintf(res, `{"first": {"href": "https://us-south.iaas.cloud.ibm.com/v1/vpcs?limit=20"}, "limit": 20, "vpcs": [{"classic_access": false, "created_at": "2019-01-01T12:00:00", "crn": "crn:v1:bluemix:public:is:us-south:a/123456::vpc:4727d842-f94f-4a2d-824a-9bc9b02c523b", "cse_source_ips": [{"ip": {"address": "192.168.3.4"}, "zone": {"href": "https://us-south.iaas.cloud.ibm.com/v1/regions/us-south/zones/us-south-1", "name": "us-south-1"}}], "default_network_acl": {"crn": "crn:v1:bluemix:public:is:us-south:a/123456::network-acl:a4e28308-8ee7-46ab-8108-9f881f22bdbf", "href": "https://us-south.iaas.cloud.ibm.com/v1/network_acls/a4e28308-8ee7-46ab-8108-9f881f22bdbf", "id": "a4e28308-8ee7-46ab-8108-9f881f22bdbf", "name": "my-network-acl"}, "default_security_group": {"crn": "crn:v1:bluemix:public:is:us-south:a/123456::security-group:be5df5ca-12a0-494b-907e-aa6ec2bfa271", "href": "https://us-south.iaas.cloud.ibm.com/v1/security_groups/be5df5ca-12a0-494b-907e-aa6ec2bfa271", "id": "be5df5ca-12a0-494b-907e-aa6ec2bfa271", "name": "my-security-group"}, "href": "https://us-south.iaas.cloud.ibm.com/v1/vpcs/4727d842-f94f-4a2d-824a-9bc9b02c523b", "id": "4727d842-f94f-4a2d-824a-9bc9b02c523b", "name": "my-vpc", "resource_group": {"href": "https://resource-controller.cloud.ibm.com/v2/resource_groups/fee82deba12e4c0fb69c3b09d1f12345", "id": "fee82deba12e4c0fb69c3b09d1f12345", "name": "my-resource-group"}, "status": "available"}]}`)
+	}))
+	defer server.Close()
+
+	// Create the VPC client and SDK interface
+	v := newNoAuthTestVpcSdkGen2(server.URL)
+
+	// Success
+	vpcs, err := v.ListVPCs()
+	assert.Equal(t, len(vpcs), 1)
+	assert.Nil(t, err)
+}
+
 func TestVpcSdkGen2_ReplaceLoadBalancerPoolMembers(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
 		res.Header().Set("Content-type", "application/json")
@@ -377,14 +506,41 @@ func TestVpcSdkGen2_ReplaceLoadBalancerPoolMembers(t *testing.T) {
 
 	// Invalid pool name
 	nodes := []string{"192.168.1.1"}
-	members, err := v.ReplaceLoadBalancerPoolMembers("lbID", "poolName", "poolID", nodes)
+	options := newServiceOptions()
+	members, err := v.ReplaceLoadBalancerPoolMembers("lbID", "poolName", "poolID", nodes, options)
 	assert.Nil(t, members)
 	assert.NotNil(t, err)
 	assert.Contains(t, err.Error(), "Invalid pool name")
 
 	// Success
-	members, err = v.ReplaceLoadBalancerPoolMembers("lbID", "tcp-80-30123", "poolID", nodes)
+	members, err = v.ReplaceLoadBalancerPoolMembers("lbID", "tcp-80-30123", "poolID", nodes, options)
 	assert.NotNil(t, members)
+	assert.Nil(t, err)
+}
+
+func TestVpcSdkGen2_UpdateLoadBalancerListener(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		res.Header().Set("Content-type", "application/json")
+		res.WriteHeader(200)
+		fmt.Fprintf(res, "%s", `{"accept_proxy_protocol": true, "certificate_instance": {"crn": "crn:v1:bluemix:public:secrets-manager:us-south:a/123456:36fa422d-080d-4d83-8d2d-86851b4001df:secret:2e786aab-42fa-63ed-14f8-d66d552f4dd5"}, "connection_limit": 2000, "created_at": "2019-01-01T12:00:00.000Z", "default_pool": {"deleted": {"more_info": "https://cloud.ibm.com/apidocs/vpc#deleted-resources"}, "href": "https://us-south.iaas.cloud.ibm.com/v1/load_balancers/dd754295-e9e0-4c9d-bf6c-58fbc59e5727/pools/70294e14-4e61-11e8-bcf4-0242ac110004", "id": "70294e14-4e61-11e8-bcf4-0242ac110004", "name": "my-load-balancer-pool"}, "href": "https://us-south.iaas.cloud.ibm.com/v1/load_balancers/dd754295-e9e0-4c9d-bf6c-58fbc59e5727/listeners/70294e14-4e61-11e8-bcf4-0242ac110004", "https_redirect": {"http_status_code": 301, "listener": {"deleted": {"more_info": "https://cloud.ibm.com/apidocs/vpc#deleted-resources"}, "href": "https://us-south.iaas.cloud.ibm.com/v1/load_balancers/dd754295-e9e0-4c9d-bf6c-58fbc59e5727/listeners/70294e14-4e61-11e8-bcf4-0242ac110004", "id": "70294e14-4e61-11e8-bcf4-0242ac110004"}, "uri": "/example?doc=get"}, "id": "70294e14-4e61-11e8-bcf4-0242ac110004", "idle_connection_timeout": 100, "policies": [{"deleted": {"more_info": "https://cloud.ibm.com/apidocs/vpc#deleted-resources"}, "href": "https://us-south.iaas.cloud.ibm.com/v1/load_balancers/dd754295-e9e0-4c9d-bf6c-58fbc59e5727/listeners/70294e14-4e61-11e8-bcf4-0242ac110004/policies/f3187486-7b27-4c79-990c-47d33c0e2278", "id": "70294e14-4e61-11e8-bcf4-0242ac110004", "name": "anyValue"}], "port": 443, "port_max": 499, "port_min": 443, "protocol": "http", "provisioning_status": "active"}`)
+	}))
+	defer server.Close()
+
+	// Create the VPC client and SDK interface
+	v := newNoAuthTestVpcSdkGen2(server.URL)
+
+	// Invalid pool name
+	options := newServiceOptions()
+	options.enabledFeatures = "nlb"
+	listener, err := v.UpdateLoadBalancerListener("lbID", "listenerID", options)
+	assert.Nil(t, listener)
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "NLB does not support updating load balancer listeners")
+
+	// Success
+	options = newServiceOptions()
+	listener, err = v.UpdateLoadBalancerListener("lbID", "listenerID", options)
+	assert.NotNil(t, listener)
 	assert.Nil(t, err)
 }
 
@@ -401,13 +557,33 @@ func TestVpcSdkGen2_UpdateLoadBalancerPool(t *testing.T) {
 
 	// Invalid pool name
 	options := newServiceOptions()
-	members, err := v.UpdateLoadBalancerPool("lbID", "poolName", &VpcLoadBalancerPool{ID: "poolID"}, options)
-	assert.Nil(t, members)
+	pool, err := v.UpdateLoadBalancerPool("lbID", "poolName", &VpcLoadBalancerPool{ID: "poolID"}, options)
+	assert.Nil(t, pool)
 	assert.NotNil(t, err)
 	assert.Contains(t, err.Error(), "Invalid pool name")
 
 	// Success
-	members, err = v.UpdateLoadBalancerPool("lbID", "tcp-80-30123", &VpcLoadBalancerPool{ID: "poolID"}, options)
-	assert.NotNil(t, members)
+	pool, err = v.UpdateLoadBalancerPool("lbID", "tcp-80-30123", &VpcLoadBalancerPool{ID: "poolID"}, options)
+	assert.NotNil(t, pool)
+	assert.Nil(t, err)
+}
+
+func TestVpcSdkGen2_UpdateLoadBalancerSubnets(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		res.Header().Set("Content-type", "application/json")
+		res.Header().Set("Etag", "W/123456789")
+		res.WriteHeader(200)
+		fmt.Fprintf(res, `{"created_at": "2019-01-01T12:00:00", "crn": "crn:v1:bluemix:public:is:us-south:a/123456::load-balancer:dd754295-e9e0-4c9d-bf6c-58fbc59e5727", "hostname": "myloadbalancer-123456-us-south-1.lb.bluemix.net", "href": "https://us-south.iaas.cloud.ibm.com/v1/load_balancers/dd754295-e9e0-4c9d-bf6c-58fbc59e5727", "id": "dd754295-e9e0-4c9d-bf6c-58fbc59e5727", "is_public": true, "listeners": [{"href": "https://us-south.iaas.cloud.ibm.com/v1/load_balancers/dd754295-e9e0-4c9d-bf6c-58fbc59e5727/listeners/70294e14-4e61-11e8-bcf4-0242ac110004", "id": "70294e14-4e61-11e8-bcf4-0242ac110004"}], "name": "my-load-balancer", "operating_status": "offline", "pools": [{"href": "https://us-south.iaas.cloud.ibm.com/v1/load_balancers/dd754295-e9e0-4c9d-bf6c-58fbc59e5727/pools/70294e14-4e61-11e8-bcf4-0242ac110004", "id": "70294e14-4e61-11e8-bcf4-0242ac110004", "name": "my-load-balancer-pool"}], "private_ips": [{"address": "192.168.33.44"}], "provisioning_status": "active", "public_ips": [{"address": "192.168.3.4"}], "resource_group": {"href": "https://resource-controller.cloud.ibm.com/v2/resource_groups/fee82deba12e4c0fb69c3b09d1f12345", "id": "fee82deba12e4c0fb69c3b09d1f12345", "name": "my-resource-group"}, "subnets": [{"crn": "crn:v1:bluemix:public:is:us-south-1:a/123456::subnet:7ec86020-1c6e-4889-b3f0-a15f2e50f87e", "href": "https://us-south.iaas.cloud.ibm.com/v1/subnets/7ec86020-1c6e-4889-b3f0-a15f2e50f87e", "id": "7ec86020-1c6e-4889-b3f0-a15f2e50f87e", "name": "my-subnet"}]}`)
+	}))
+	defer server.Close()
+
+	// Create the VPC client and SDK interface
+	v := newNoAuthTestVpcSdkGen2(server.URL)
+
+	// Invalid pool name
+	options := newServiceOptions()
+	subnetList := []string{"subnetID"}
+	lb, err := v.UpdateLoadBalancerSubnets("lbID", subnetList, options)
+	assert.NotNil(t, lb)
 	assert.Nil(t, err)
 }
