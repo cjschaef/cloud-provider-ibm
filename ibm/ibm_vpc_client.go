@@ -56,6 +56,7 @@ var newVpcSdkClient = func(provider Provider) (*vpcv1.VpcV1, error) {
 
 	// If the IAM endpoint override was specified in the config, update the URL
 	if provider.IamEndpointOverride != "" {
+		klog.Infof("Override IAM endpoint to: %s", provider.IamEndpointOverride)
 		authenticator.URL = provider.IamEndpointOverride
 	}
 
@@ -70,8 +71,10 @@ var newVpcSdkClient = func(provider Provider) (*vpcv1.VpcV1, error) {
 	// If the VPC RIaaS endpoint override was specified in the config, update the URL
 	if provider.G2EndpointOverride != "" {
 		// Set the Service URL
+		klog.Infof("Override VPC endpoint to: %s", provider.G2EndpointOverride)
 		err = sdk.SetServiceURL(provider.G2EndpointOverride + "/v1")
 		if err != nil {
+			klog.Warningf("Override VPC endpoint failed: %s", err)
 			return nil, err
 		}
 
@@ -130,13 +133,29 @@ func (vpc *vpcClient) populateNodeMetadata(nodeName string, node *NodeMetadata) 
 	listInstOptions.SetVPCName(vpc.provider.G2VpcName)
 
 	// Get Instances list
-	instances, _, err := vpc.sdk.ListInstances(listInstOptions)
+	instances, resp, err := vpc.sdk.ListInstances(listInstOptions)
 	if err != nil {
+		klog.Warningf("Client error working with IAM: %s", vpc.provider.IamEndpointOverride)
+		klog.Warningf("Error with Resource Manager: %s", vpc.provider.RmEndpointOverride)
+		klog.Warningf("Error with VPC: %s", vpc.provider.G2EndpointOverride)
+		if resp != nil {
+			klog.Warningf("Response: %s", resp)
+			klog.Warningf("Response SC: %d", resp.StatusCode)
+			klog.Warningf("Response raw: %s", resp.RawResult)
+		}
 		return err
 	}
 
 	// Check if instance is not nil
 	if instances == nil {
+		klog.Warningf("Client failed retrieve working with IAM: %s", vpc.provider.IamEndpointOverride)
+		klog.Warningf("Failed with Resource Manager: %s", vpc.provider.RmEndpointOverride)
+		klog.Warningf("Failed with VPC: %s", vpc.provider.G2EndpointOverride)
+		if resp != nil {
+			klog.Warningf("Response: %s", resp)
+			klog.Warningf("Response SC: %d", resp.StatusCode)
+			klog.Warningf("Response raw: %s", resp.RawResult)
+		}
 		return errors.New("Could not retrieve a list of instances: name=" + nodeName + " url=" + vpc.sdk.GetServiceURL())
 	}
 

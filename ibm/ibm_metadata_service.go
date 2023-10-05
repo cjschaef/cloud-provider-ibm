@@ -207,9 +207,13 @@ func (ms *MetadataService) GetNodeMetadata(name string, applyNetworkUnavailable 
 		if ms.vpcClient == nil {
 			ms.vpcClient, err = newVpcClient(ms.provider)
 			if err != nil {
+				klog.Warning("Failed VPC Client creation")
 				return node, err
 			}
 		}
+		klog.Infof("VPC Client created with IAM endpoint: %s", ms.provider.IamEndpointOverride)
+		klog.Infof("VPC Client with ResourceManager endpoint: %", ms.provider.RmEndpointOverride)
+		klog.Infof("VPC Client with VPC endpoint: %s", ms.provider.G2EndpointOverride)
 
 		// gather node information from VPC
 		err = ms.vpcClient.populateNodeMetadata(name, &newNode)

@@ -73,6 +73,7 @@ func convertResourceGroupNameToID(c *ConfigVpc) error {
 	}
 	// If resource manager endpoint override was configured, use it instead
 	if c.RmEndpointOverride != "" {
+		klog.Infof("Override Resource Manager endpoint to: %s", c.RmEndpointOverride)
 		url = c.RmEndpointOverride
 	}
 	// Create resource manager client
